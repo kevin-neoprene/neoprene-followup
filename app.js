@@ -826,7 +826,8 @@ function syncEmail() {
         setStatus('邮箱同步完成，正在刷新列表……');
         loadAll();
       } else {
-        var msg = (r.body && (r.body.error || r.body.message)) || ('同步服务返回 HTTP ' + r.status);
+        // 优先显示 message（具体原因，如“拉取 INBOX 正文超时”），而不是 error 代码 sync_failed
+        var msg = (r.body && (r.body.message || r.body.error)) || ('同步服务返回 HTTP ' + r.status);
         $('syncStatus').textContent = '邮箱未连接：' + msg + '（请在 Vercel 环境变量配置 IMAP：IMAP_HOST=imap.yunyou.top，IMAP_USER=kevin@neoprenecustom.com）';
         setStatus('邮箱同步未完成：' + msg, true);
       }
