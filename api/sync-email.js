@@ -490,6 +490,11 @@ module.exports = async function handler(req, res) {
         var sentAt = parsed.date ? new Date(parsed.date).toISOString() : new Date().toISOString();
         var inReplyTo = String(parsed.inReplyTo || '');
         var refs = String(parsed.references || '');
+        // 自己发给自己的信（收件箱里 from 是自己，如给自己留的客户备注）和云邮系统
+        // 通知（noreply@yunyou.top 安全提醒）：只入库留档做去重，不进待判断、不改
+        // 任何跟进状态。2026-11-16 首轮同步曾把这类信标成待判断，混进了人工池。
+        var isSelfOrSystem = direction === 'in' &&
+          (fromEmail === user.toLowerCase() || fromEmail === 'noreply@yunyou.top');
 
         // 匹配：先 In-Reply-To / References 对上已有往来，再按对方邮箱对上客户
         var match = null;
@@ -558,10 +563,10 @@ module.exports = async function handler(req, res) {
           }
         }
 
-        // 分类：只有收到的信才需要判断；发出的信不需要
+        // 分类：只有收到的信才需要判断；发出的信不需要；自己/系统信直接记 other、不进待判断
         var cls = { intent: 'other', confidence: 'high' };
         var needsReview = false;
-        if (direction === 'in') {
+        if (direction === 'in' && !isSelfOrSystem) {
           cls = classifyEmail(subject, bodyText, fromEmail);
           needsReview = cls.intent === 'auto_unknown';
         }
@@ -588,8 +593,9 @@ module.exports = async function handler(req, res) {
         if (matched) summary.matched++;
         if (needsReview) summary.needs_review++;
 
-        // 更新跟进状态（保守：只改时间与下一步，不自动成交/丢单）
-        if (inquiryId) {
+        // 更新跟进状态（保守：只改时间与下一步，不自动成交/丢单）。
+        // 自己/系统信不更新任何跟进状态（上面已说明）。
+        if (inquiryId && !isSelfOrSystem) {
           if (direction === 'in') {
             // 待判断是 reply_status（原文口径），不是 status 桶：status 桶由日期 + stage 计算
             await sb.update('followup_inquiries', inquiryId, {
@@ -657,7 +663,7 @@ module.exports = async function handler(req, res) {
               } catch (e) { summary.errors.push('开发计数失败：' + e.message); }
             }
           }
-        } else if (customer) {
+        } else if (customer && !isSelfOrSystem) {
           await sb.update('followup_customers', customer.id, {
             last_contact_at: sentAt, updated_at: new Date().toISOString()
           });
