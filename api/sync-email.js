@@ -323,6 +323,8 @@ function findSentBox(imap) {
   });
 }
 
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
 function connectImap(Imap, cfg) {
   return new Promise(function (resolve, reject) {
     var imap = new Imap({
@@ -332,13 +334,31 @@ function connectImap(Imap, cfg) {
       port: cfg.port,
       tls: true,
       tlsOptions: { rejectUnauthorized: true },
-      connTimeout: 15000,
-      authTimeout: 10000
+      // 云邮服务器响应慢（01:03 那次 10 秒认证超时）：放宽到 30 秒。
+      connTimeout: 30000,
+      authTimeout: 30000
     });
     imap.once('ready', function () { resolve(imap); });
     imap.once('error', function (err) { reject(new Error('IMAP 连接失败（' + cfg.host + ':' + cfg.port + '）：' + err.message + '。请检查 Vercel 环境变量与网页邮箱里 IMAP 是否已开启。')); });
     imap.connect();
   });
+}
+
+// 连不上就等 5 秒再试一次（服务器一时忙很常见；两次都失败才报错返回）。
+async function connectImapWithRetry(Imap, cfg) {
+  var lastErr = null;
+  for (var attempt = 1; attempt <= 2; attempt++) {
+    try {
+      var imap = await connectImap(Imap, cfg);
+      if (attempt > 1) console.log('[sync] IMAP 第 ' + attempt + ' 次连接成功');
+      return imap;
+    } catch (e) {
+      lastErr = e;
+      console.log('[sync] IMAP 第 ' + attempt + ' 次连接失败：' + e.message);
+      if (attempt < 2) await sleep(5000);
+    }
+  }
+  throw lastErr;
 }
 
 // ---------- 主处理 ----------
@@ -406,7 +426,7 @@ module.exports = async function handler(req, res) {
 
     // 2) IMAP 只读拉取：先拉信头做去重，再只拉新邮件的正文。
     //    收件箱 + 已发件（文件夹名按服务商可能不同，逐个试）
-    imap = await connectImap(Imap, { user: user, pass: pass, host: host, port: port });
+    imap = await connectImapWithRetry(Imap, { user: user, pass: pass, host: host, port: port });
     console.log('[sync] IMAP 已连接 ' + host + ':' + port);
     var since = new Date();
     since.setDate(since.getDate() - syncDays);
