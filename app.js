@@ -807,7 +807,11 @@ function syncEmail() {
   btn.disabled = true;
   btn.textContent = '同步中……';
   $('syncStatus').textContent = '正在连接邮箱同步服务……';
-  fetch('/api/sync-email', { method: 'POST' })
+  // 服务端 240 秒主动截止返回；前端 280 秒兜底，超时就放开按钮并提示，
+  // 绝不一直卡在“同步中……”上（2026-11-16 旧版曾卡 4 分钟无响应）。
+  var ctrl = new AbortController();
+  var timer = setTimeout(function () { ctrl.abort(); }, 280000);
+  fetch('/api/sync-email', { method: 'POST', signal: ctrl.signal })
     .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, status: res.status, body: body }; }); })
     .then(function (r) {
       if (r.ok) {
@@ -823,12 +827,21 @@ function syncEmail() {
         setStatus('邮箱同步未完成：' + msg, true);
       }
     })
-    .catch(function () {
+    .catch(function (e) {
+      clearTimeout(timer);
+      if (e && e.name === 'AbortError') {
+        // 服务端超过 280 秒未返回：可能邮箱里新邮件太多，本轮没跑完。
+        // 服务端会在 240 秒时主动返回部分结果；这次没等到，刷新页面看“上次同步”是否已更新，
+        // 没更新就再点一次同步（已入库的邮件不会重复）。
+        $('syncStatus').textContent = '同步超时：服务器 280 秒未返回，请刷新页面查看“上次同步”是否已更新，没更新就再点一次同步。';
+        setStatus('同步超时（服务器未在 280 秒内返回）。已入库的邮件不会重复，再点一次同步会继续处理剩下的。', true);
+        return;
+      }
       // 本地用 file:// 打开或未部署时，/api/sync-email 根本不存在，走这条分支是正常的。
       $('syncStatus').textContent = '邮箱未连接：请在 Vercel 环境变量配置 IMAP（IMAP_HOST=imap.yunyou.top，IMAP_USER=kevin@neoprenecustom.com），部署后点“同步邮箱”才生效。';
       setStatus('同步接口不可用（本地预览时正常，部署到 Vercel 后才生效）。', true);
     })
-    .finally(function () { btn.disabled = false; btn.textContent = '🔄 同步邮箱'; });
+    .finally(function () { clearTimeout(timer); btn.disabled = false; btn.textContent = '🔄 同步邮箱'; });
 }
 
 // ---------- 加载 ----------
