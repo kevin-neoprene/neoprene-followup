@@ -652,9 +652,12 @@ module.exports = async function handler(req, res) {
               } catch (e) { summary.errors.push('阅读计数失败：' + e.message); }
             }
           } else {
-            // 只往后推，不往前推：旧邮件的 sent+3 可能比用户已确认的下次跟进日期
-            // 更早，不能把已确认的日期往回改（01:10 那轮因此多出 19 条逾期）。
+            // 只往后推，不往前推；且只设未来的日期：旧邮件的 sent+3 可能比用户已
+            // 确认的下次跟进日期更早，不能把已确认的日期往回改（01:10 那轮因此多
+            // 出 19 条逾期）；当前无日期（待定日期）时，过期了的 sent+3 也不写，
+            // 留空待用户确认（01:16 那轮又有 11 条因此变逾期）。
             var newNext = addDaysStr(sentAt, 3);
+            var today = new Date().toISOString().slice(0, 10);
             var curNext = null;
             try {
               var curInq = await sb.list('followup_inquiries',
@@ -662,7 +665,9 @@ module.exports = async function handler(req, res) {
               if (curInq && curInq[0]) curNext = curInq[0].next_followup_at || null;
             } catch (e) { /* 读不到当前日期就按原来的写 */ }
             var patchOut = { updated_at: new Date().toISOString() };
-            if (!curNext || newNext > String(curNext).slice(0, 10)) patchOut.next_followup_at = newNext;
+            if (newNext >= today && (!curNext || newNext > String(curNext).slice(0, 10))) {
+              patchOut.next_followup_at = newNext;
+            }
             await sb.update('followup_inquiries', inquiryId, patchOut);
             // v3：你发出的跟进邮件默认建一条 +3 天的待办（与前端写跟进一致）；
             // 指纹冲突（同一天已建过）时跳过，不报错。到期日已过的旧邮件不建
