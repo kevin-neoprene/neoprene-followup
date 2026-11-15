@@ -652,25 +652,36 @@ module.exports = async function handler(req, res) {
               } catch (e) { summary.errors.push('阅读计数失败：' + e.message); }
             }
           } else {
-            await sb.update('followup_inquiries', inquiryId, {
-              next_followup_at: addDaysStr(sentAt, 3),
-              updated_at: new Date().toISOString()
-            });
+            // 只往后推，不往前推：旧邮件的 sent+3 可能比用户已确认的下次跟进日期
+            // 更早，不能把已确认的日期往回改（01:10 那轮因此多出 19 条逾期）。
+            var newNext = addDaysStr(sentAt, 3);
+            var curNext = null;
+            try {
+              var curInq = await sb.list('followup_inquiries',
+                'select=next_followup_at&id=eq.' + encodeURIComponent(inquiryId) + '&limit=1');
+              if (curInq && curInq[0]) curNext = curInq[0].next_followup_at || null;
+            } catch (e) { /* 读不到当前日期就按原来的写 */ }
+            var patchOut = { updated_at: new Date().toISOString() };
+            if (!curNext || newNext > String(curNext).slice(0, 10)) patchOut.next_followup_at = newNext;
+            await sb.update('followup_inquiries', inquiryId, patchOut);
             // v3：你发出的跟进邮件默认建一条 +3 天的待办（与前端写跟进一致）；
-            // 指纹冲突（同一天已建过）时跳过，不报错。
+            // 指纹冲突（同一天已建过）时跳过，不报错。到期日已过的旧邮件不建
+            // （建了也是立刻逾期的旧待办，询盘自己的下次跟进日期说了算）。
             try {
               var todoDue = addDaysStr(sentAt, 3);
-              await sb.insert('followup_todos', {
-                customer_id: customer ? customer.id : null,
-                inquiry_id: inquiryId,
-                reason: '跟进邮件已发出：' + subject,
-                next_action: '等客户回复；' + todoDue + ' 前未回再跟进一次',
-                due_at: todoDue,
-                done: false,
-                stopped_by_reply: false,
-                fingerprint: 'sync-out|' + inquiryId + '|' + todoDue
-              });
-              summary.todos_created++;
+              if (todoDue >= new Date().toISOString().slice(0, 10)) {
+                await sb.insert('followup_todos', {
+                  customer_id: customer ? customer.id : null,
+                  inquiry_id: inquiryId,
+                  reason: '跟进邮件已发出：' + subject,
+                  next_action: '等客户回复；' + todoDue + ' 前未回再跟进一次',
+                  due_at: todoDue,
+                  done: false,
+                  stopped_by_reply: false,
+                  fingerprint: 'sync-out|' + inquiryId + '|' + todoDue
+                });
+                summary.todos_created++;
+              }
             } catch (e) { /* 指纹冲突即已建过，跳过 */ }
             // v3 开发计数：发出一封跟进邮件，outreach_count +1
             if (customer) {
