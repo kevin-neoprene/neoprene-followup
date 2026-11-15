@@ -151,14 +151,19 @@ function makeSb(baseUrl, serviceKey) {
 }
 
 // ---------- IMAP：只读拉取 ----------
-// 先拉信头（HEADER.FIELDS）：只含 Message-ID / 日期 / 收发件人 / 主题 / In-Reply-To /
-// References，体积小，用来做“哪些是新邮件”的去重，不下载正文。
-function fetchHeaders(imap, simpleParser, boxName, sinceDate) {
+// 完成模型（2026-11-16 修）：一次 fetch 只有在“服务器流结束（end 事件）且所有
+// 已到的邮件都处理完（pending 回 0）”时才算完成。旧版在 pending 回 0 时立刻
+// resolve，服务器慢慢吐数据时会在中途提前返回——00:39 那次只拿到了 12 封信头，
+// 而 00:31 那次拿到了 233 封，同一个邮箱同一窗口，纯属时序运气。
+function collectFetch(fetch, onMessage, timeoutMs, label) {
   return new Promise(function (resolve, reject) {
     var timer = setTimeout(function () {
-      reject(new Error('拉取 ' + boxName + ' 信头超时（' + (FETCH_TIMEOUT_MS / 1000) + ' 秒无响应）'));
-    }, FETCH_TIMEOUT_MS);
+      finish(new Error('拉取' + label + '超时（' + (timeoutMs / 1000) + ' 秒无响应）'));
+    }, timeoutMs);
     var done = false;
+    var ended = false;
+    var pending = 0;
+    var out = [];
     function finish(err, val) {
       if (done) return;
       done = true;
@@ -166,34 +171,56 @@ function fetchHeaders(imap, simpleParser, boxName, sinceDate) {
       if (err) reject(err);
       else resolve(val);
     }
+    function maybeDone() {
+      if (ended && pending === 0) finish(null, out);
+    }
+    fetch.on('message', function (msg) {
+      pending++;
+      onMessage(msg, function (item) {
+        if (item) out.push(item);
+        pending--;
+        maybeDone();
+      });
+    });
+    fetch.once('error', function (e) { finish(new Error('拉取' + label + '失败：' + e.message)); });
+    fetch.once('end', function () { ended = true; maybeDone(); });
+  });
+}
+
+// 先拉信头（HEADER.FIELDS）：只含 Message-ID / 日期 / 收发件人 / 主题 / In-Reply-To /
+// References，体积小，用来做“哪些是新邮件”的去重，不下载正文。
+// 返回 [{ uid, messageId, date, from, to, subject, inReplyTo, refs }]。
+// UID 只能从 attributes 事件取（attrs.uid），msg.uid 不存在（00:35 的教训）。
+function fetchHeaders(imap, simpleParser, boxName, sinceDate) {
+  return new Promise(function (resolve, reject) {
     imap.openBox(boxName, true, function (err) {
-      if (err) return finish(new Error('打不开邮箱文件夹 ' + boxName + '：' + err.message));
+      if (err) return reject(new Error('打不开邮箱文件夹 ' + boxName + '：' + err.message));
       imap.search([['SINCE', imapDate(sinceDate)]], function (err2, results) {
-        if (err2) return finish(new Error('搜索 ' + boxName + ' 失败：' + err2.message));
-        if (!results || !results.length) return finish(null, []);
+        if (err2) return reject(new Error('搜索 ' + boxName + ' 失败：' + err2.message));
+        if (!results || !results.length) return resolve([]);
         var fetch = imap.fetch(results, {
           bodies: 'HEADER.FIELDS (MESSAGE-ID DATE FROM TO SUBJECT IN-REPLY-TO REFERENCES)',
           struct: false
         });
-        var headers = [];
-        var pending = 0;
-        fetch.on('message', function (msg) {
-          pending++;
+        collectFetch(fetch, function (msg, doneOne) {
           var raw = '';
           var uid = null;
           var parsedHeader = null;
           var bodyDone = false;
           var attrsDone = false;
           function maybePush() {
-            // 信头解析和 UID（attributes 事件）都到了才入列；任一不到就等，
-            // 超时由外层 FETCH_TIMEOUT_MS 兜底，不无限挂起。
             if (!bodyDone || !attrsDone) return;
-            if (parsedHeader) headers.push({ uid: uid, messageId: parsedHeader.messageId, date: parsedHeader.date, from: parsedHeader.from, to: parsedHeader.to, subject: parsedHeader.subject, inReplyTo: parsedHeader.inReplyTo, refs: parsedHeader.refs });
-            pending--;
-            if (pending === 0) finish(null, headers);
+            doneOne(parsedHeader ? {
+              uid: uid,
+              messageId: parsedHeader.messageId,
+              date: parsedHeader.date,
+              from: parsedHeader.from,
+              to: parsedHeader.to,
+              subject: parsedHeader.subject,
+              inReplyTo: parsedHeader.inReplyTo,
+              refs: parsedHeader.refs
+            } : null);
           }
-          // node-imap 的 UID 不在 msg.uid 上，只能从 attributes 事件取（attrs.uid）。
-          // 旧版误用 msg.uid 恒为 undefined，导致正文拉取的 UID 全被过滤掉、0 封入库。
           msg.once('attributes', function (attrs) { uid = attrs.uid; attrsDone = true; maybePush(); });
           msg.on('body', function (stream) {
             stream.on('data', function (chunk) { raw += chunk.toString('utf8'); });
@@ -214,59 +241,85 @@ function fetchHeaders(imap, simpleParser, boxName, sinceDate) {
               }).finally(function () { bodyDone = true; maybePush(); });
             });
           });
-        });
-        fetch.once('error', function (e) { finish(new Error('拉取 ' + boxName + ' 信头失败：' + e.message)); });
-        fetch.once('end', function () {
-          if (pending === 0) finish(null, headers);
-        });
+        }, FETCH_TIMEOUT_MS, boxName + ' 信头').then(resolve, reject);
       });
     });
   });
 }
 
 // 只拉指定 UID 的完整正文（已在信头阶段确认是新邮件的才拉，不浪费流量和内存）。
-// 逐封解析完立刻返回，不攒大数组。
-function fetchBodies(imap, simpleParser, boxName, uids) {
+// 分小批拉（默认每批 10 封、每批 30 秒）：云邮拉大附件很慢，一封卡住不能拖垮整批；
+// 超时或失败的整批跳过（计入 skipped，下次同步重试），继续拉下一批，不整体报错。
+// isPastDeadline() 为真时停下不再拉新批次。返回 { mails, skipped }。
+function fetchBodiesBatched(imap, simpleParser, boxName, uids, isPastDeadline) {
+  var BATCH_SIZE = 10;
+  var BATCH_TIMEOUT_MS = 30000;
+  if (!uids || !uids.length) return Promise.resolve({ mails: [], skipped: 0 });
   return new Promise(function (resolve, reject) {
-    if (!uids || !uids.length) return resolve([]);
-    var timer = setTimeout(function () {
-      reject(new Error('拉取 ' + boxName + ' 正文超时（' + (FETCH_TIMEOUT_MS / 1000) + ' 秒无响应）'));
-    }, FETCH_TIMEOUT_MS);
-    var done = false;
-    function finish(err, val) {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      if (err) reject(err);
-      else resolve(val);
-    }
     imap.openBox(boxName, true, function (err) {
-      if (err) return finish(new Error('打不开邮箱文件夹 ' + boxName + '：' + err.message));
-      var fetch = imap.fetch(uids, { bodies: '', markSeen: false });
+      if (err) return reject(new Error('打不开邮箱文件夹 ' + boxName + '：' + err.message));
       var mails = [];
-      var pending = 0;
-      fetch.on('message', function (msg) {
-        pending++;
-        var raw = '';
-        msg.on('body', function (stream) {
-          stream.on('data', function (chunk) { raw += chunk.toString('utf8'); });
-          stream.once('end', function () {
-            simpleParser(raw).then(function (parsed) {
-              mails.push(parsed);
-            }).catch(function (e) {
-              mails.push({ _parseError: e.message, _rawSnippet: raw.slice(0, 500) });
-            }).finally(function () {
-              pending--;
-              if (pending === 0) finish(null, mails);
+      var skipped = 0;
+      var i = 0;
+      function nextBatch() {
+        if (i >= uids.length) return resolve({ mails: mails, skipped: skipped });
+        if (isPastDeadline && isPastDeadline()) {
+          skipped += uids.length - i;
+          return resolve({ mails: mails, skipped: skipped });
+        }
+        var chunk = uids.slice(i, i + BATCH_SIZE);
+        i += chunk.length;
+        var fetch = imap.fetch(chunk, { bodies: '', markSeen: false });
+        collectFetch(fetch, function (msg, doneOne) {
+          var raw = '';
+          msg.on('body', function (stream) {
+            stream.on('data', function (chunk2) { raw += chunk2.toString('utf8'); });
+            stream.once('end', function () {
+              simpleParser(raw).then(function (parsed) {
+                doneOne(parsed);
+              }).catch(function (e) {
+                doneOne({ _parseError: e.message, _rawSnippet: raw.slice(0, 500) });
+              });
             });
           });
+        }, BATCH_TIMEOUT_MS, boxName + ' 正文').then(function (batchMails) {
+          mails = mails.concat(batchMails);
+          nextBatch();
+        }, function () {
+          // 整批超时/失败：跳过这批，继续下一批（这些邮件下次同步重试）
+          skipped += chunk.length;
+          nextBatch();
         });
-      });
-      fetch.once('error', function (e) { finish(new Error('拉取 ' + boxName + ' 正文失败：' + e.message)); });
-      fetch.once('end', function () {
-        if (pending === 0) finish(null, mails);
-      });
+      }
+      nextBatch();
     });
+  });
+}
+
+// 列出邮箱文件夹，找已发件的那个（名字各家不同：Sent / 已发送 / 发件箱 …）。
+// 旧版逐个试 'Sent' / 'Sent Messages' / '已发送'，每个不存在的名字都耗满 60 秒
+// 超时（00:39 那次 3 分钟悄无声息就是这么烧掉的）。找不到就返回 null，直接跳过已发件。
+function findSentBox(imap) {
+  return new Promise(function (resolve) {
+    var timer = setTimeout(function () { resolve(null); }, 10000);
+    try {
+      imap.getBoxes(function (err, boxes) {
+        clearTimeout(timer);
+        if (err || !boxes) return resolve(null);
+        var names = [];
+        (function walk(o) {
+          Object.keys(o || {}).forEach(function (k) {
+            names.push(k);
+            if (o[k].children) walk(o[k].children);
+          });
+        })(boxes);
+        var hit = null;
+        for (var n = 0; n < names.length; n++) {
+          if (/sent|已发送|发件/i.test(names[n])) { hit = names[n]; break; }
+        }
+        resolve(hit);
+      });
+    } catch (e) { clearTimeout(timer); resolve(null); }
   });
 }
 
@@ -365,17 +418,21 @@ module.exports = async function handler(req, res) {
       .sort(function (a, b) { return (b.date ? b.date.getTime() : 0) - (a.date ? a.date.getTime() : 0); });
     console.log('[sync] INBOX 新邮件 ' + inboxNew.length + ' 封');
 
+    // 已发件文件夹：先列出真实文件夹名再决定，不再逐个试名字（旧版每个不存在的
+    // 名字都耗满 60 秒超时，00:39 那次 3 分钟悄无声息就是这么烧掉的）。
+    var sentBox = await findSentBox(imap);
+    console.log('[sync] 已发件文件夹：' + (sentBox || '未找到，跳过已发件'));
     var sentHeaders = [];
-    var sentNew = [];
-    var sentFolders = ['Sent', 'Sent Messages', '已发送'];
-    for (var i = 0; i < sentFolders.length; i++) {
+    if (sentBox) {
       try {
-        sentHeaders = await fetchHeaders(imap, simpleParser, sentFolders[i], since);
-        console.log('[sync] ' + sentFolders[i] + ' 信头 ' + sentHeaders.length + ' 封');
-        break;
-      } catch (e) { /* 该名字不存在就试下一个 */ }
+        sentHeaders = await fetchHeaders(imap, simpleParser, sentBox, since);
+        console.log('[sync] ' + sentBox + ' 信头 ' + sentHeaders.length + ' 封');
+      } catch (e) {
+        console.log('[sync] 已发件信头拉取失败，跳过已发件：' + e.message);
+        sentHeaders = [];
+      }
     }
-    sentNew = sentHeaders
+    var sentNew = sentHeaders
       .filter(function (h) { return h.messageId && !knownIds[h.messageId]; })
       .sort(function (a, b) { return (b.date ? b.date.getTime() : 0) - (a.date ? a.date.getTime() : 0); });
     console.log('[sync] 已发件新邮件 ' + sentNew.length + ' 封');
@@ -389,23 +446,21 @@ module.exports = async function handler(req, res) {
         ((inboxNew.length - inboxTake.length) + (sentNew.length - sentTake.length)) +
         ' 封下次同步继续。');
     }
-    var inbox = inboxTake.length ? await fetchBodies(imap, simpleParser, 'INBOX',
-      inboxTake.map(function (h) { return h.uid; }).filter(Boolean)) : [];
-    console.log('[sync] INBOX 正文拉到 ' + inbox.length + ' 封');
-    var sent = [];
-    if (sentTake.length) {
-      // 已发件实际用的文件夹名是上面试出来的那个
-      var sentBox = 'Sent';
-      for (var k = 0; k < sentFolders.length; k++) {
-        try {
-          sent = await fetchBodies(imap, simpleParser, sentFolders[k],
-            sentTake.map(function (h) { return h.uid; }).filter(Boolean));
-          sentBox = sentFolders[k];
-          break;
-        } catch (e) { /* 换下一个名字试 */ }
-      }
-      console.log('[sync] ' + sentBox + ' 正文拉到 ' + sent.length + ' 封');
+    var inboxRes = inboxTake.length ? await fetchBodiesBatched(imap, simpleParser, 'INBOX',
+      inboxTake.map(function (h) { return h.uid; }).filter(Boolean), pastDeadline) : { mails: [], skipped: 0 };
+    var inbox = inboxRes.mails;
+    console.log('[sync] INBOX 正文拉到 ' + inbox.length + ' 封' +
+      (inboxRes.skipped ? '，跳过 ' + inboxRes.skipped + ' 封（拉取超时，下次重试）' : ''));
+    if (inboxRes.skipped) summary.errors.push('INBOX 有 ' + inboxRes.skipped + ' 封新邮件正文拉取超时未入库，下次同步重试。');
+    var sentRes = { mails: [], skipped: 0 };
+    if (sentTake.length && sentBox) {
+      sentRes = await fetchBodiesBatched(imap, simpleParser, sentBox,
+        sentTake.map(function (h) { return h.uid; }).filter(Boolean), pastDeadline);
+      console.log('[sync] ' + sentBox + ' 正文拉到 ' + sentRes.mails.length + ' 封' +
+        (sentRes.skipped ? '，跳过 ' + sentRes.skipped + ' 封（拉取超时，下次重试）' : ''));
+      if (sentRes.skipped) summary.errors.push('已发件有 ' + sentRes.skipped + ' 封新邮件正文拉取超时未入库，下次同步重试。');
     }
+    var sent = sentRes.mails;
 
     // 3) 逐封处理（每封处理完立即入库，不攒着；临近截止时间就停，返回部分结果）
     var jobs = [];
