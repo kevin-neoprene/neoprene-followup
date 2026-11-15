@@ -1,0 +1,89 @@
+sheet,excel_column,supabase_table,supabase_column,notes
+客户档案,客户档案编号,followup_customers,profile_no,"主键；贯穿所有表；216 个唯一；UUID 文本（个别为 import- 前缀）"
+客户档案,公司 / 品牌,followup_customers,company,
+客户档案,联系人姓名,followup_customers,name,
+客户档案,国家 / 地区,followup_customers,country,
+客户档案,客户职位,followup_customers,job_title,
+客户档案,邮箱,followup_customers,email,"小写去重；216 个全有且唯一；邮件同步的匹配键"
+客户档案,官网,followup_customers,website,
+客户档案,手机号码,followup_customers,phone,"保留文本格式；勿转数字"
+客户档案,WhatsApp,followup_customers,whatsapp,"保留文本格式"
+客户档案,其他联系方式,followup_customers,other_contact,
+客户档案,客户类型,followup_customers,customer_type,"品牌商 35 / 其他 20 / 制造商 7 / 贸易商 3 / 批发商 1 / 空 150"
+客户档案,客户来源,followup_customers,source,
+客户档案,客户背景,followup_customers,background,
+客户档案,客户备注,followup_customers,notes,
+客户档案,WhatsApp 核实状态,followup_customers,whatsapp_verified,"未核实 215 / 客户提供的 WhatsApp 1"
+客户档案,中文背调状态,followup_customers,cn_background_status,"已完成 129 / 研究未完成 87"
+客户档案,创建时间（UTC）,followup_customers,source_created_at,"旧站原文时间；勿覆盖 created_at"
+客户档案,更新时间（UTC）,followup_customers,source_updated_at,
+客户档案,版本号,followup_customers,source_version,"保留文本格式"
+客户档案,—,followup_customers,verification_status,"v3 新列：导出文件无此列，导入默认 unverified（未验证）；只有 valid / unknown 以后可群发"
+客户档案,客户来源,followup_customers,tags,"v3 新列：标签播种——来源原文作来源标签；另按询盘的产品类别+询盘日期播“产品｜YYYY-MM”标签；行业段不编造，缺的留空"
+客户档案,—,followup_customers,outreach_count,"v3 新列：导入默认 0；同步发出一封跟进邮件 +1"
+客户档案,—,followup_customers,read_count,"v3 新列：导入默认 0；同步收到一封匹配到的回复 +1"
+跟进评估,客户档案编号,followup_customers,profile_no,"连接键；216 行与客户档案一一对应"
+跟进评估,当前重要等级,followup_customers,grade,"A·重点跟进 21 / B·正常推进 113 / C·暂缓/低优先 5 / 待评估 77；与系统建议等级完全一致"
+跟进评估,等级设置,followup_customers,grade_source,"系统自动判断 214 / 手动 A·重点跟进 2"
+跟进评估,手动等级理由,followup_customers,grade_reason,
+跟进评估,跟进建议,followup_customers,eval_advice,
+跟进评估,建议下一步,followup_customers,eval_next_action,"无空值；客户无询盘时作为 customers.next_action"
+跟进评估,判断依据,followup_customers,eval_basis,
+跟进评估,待补信息,followup_customers,eval_missing_info,
+跟进评估,核实限制,followup_customers,eval_limits,
+跟进评估,当前重要等级,followup_customers,stage,"等级映射：A→重点跟进；B→正常推进；C→暂缓/低优先；待评估→待评估"
+跟进评估,产品与业务匹配 / 采购需求明确度 / 采购时间 / 合作潜力（你的判断）/ 客户联系意愿 / 采购量 / 需求补充,followup_customers,eval_detail,"评估输入项；原样存入 JSONB，不单独立列（见 IMPORT.md）"
+关联询盘,客户档案编号,followup_inquiries,profile_no,"连接键；用于解析 customer_id；0 孤儿"
+关联询盘,询盘编号,followup_inquiries,inquiry_no,"主键；201 个唯一；UUID 文本"
+关联询盘,公司,followup_inquiries,—,"不导入；以客户档案的 company 为准"
+关联询盘,联系人,followup_inquiries,—,"不导入；以客户档案的 name 为准"
+关联询盘,国家,followup_inquiries,—,"不导入；以客户档案的 country 为准"
+关联询盘,联系方式,followup_inquiries,—,"不导入；以客户档案的 phone / email 为准"
+关联询盘,产品类别,followup_inquiries,product_category,"141 条为空"
+关联询盘,产品需求,followup_inquiries,product,
+关联询盘,规格,followup_inquiries,specs,
+关联询盘,询盘日期,followup_inquiries,inquiry_date,"同时写入 first_inquiry_at"
+关联询盘,最近联系日期,followup_inquiries,last_contact_at,"同时取最大值写入 customers.last_contact_at"
+关联询盘,当前阶段,followup_inquiries,stage,"原文：新询盘 104 / 需求澄清 37 / 打样中 24 / 已报价 21 / 商务确认 8 / 暂缓 3 / 已关闭 3 / 已成交 1"
+关联询盘,客户回复状态,followup_inquiries,reply_status,"原文：已回复·待判断 126 / 未回复·等待客户 67 / 已回复·已处理 8"
+关联询盘,最近回复,followup_inquiries,reply_snippet,"原文摘要；邮件正文以后由邮箱同步补"
+关联询盘,下一步动作,followup_inquiries,next_action,
+关联询盘,下次跟进日期,followup_inquiries,next_followup_at,"15 条为空；与“日期已手动确认=否”一一对应"
+关联询盘,日期已手动确认,followup_inquiries,next_followup_confirmed,"是→true（186）；否→false（15）"
+关联询盘,询盘备注,followup_inquiries,notes,
+关联询盘,创建时间（UTC）,followup_inquiries,source_created_at,
+关联询盘,更新时间（UTC）,followup_inquiries,source_updated_at,
+关联询盘,版本号,followup_inquiries,source_version,
+关联询盘,—,followup_inquiries,status,"不导入；前端由下次跟进日期 + stage + reply_status 实时计算"
+询盘跟进历史,客户档案编号,followup_history,profile_no,"连接键；0 孤儿"
+询盘跟进历史,询盘编号,followup_history,inquiry_no,"连接键；0 孤儿；201 条询盘全有历史"
+询盘跟进历史,记录编号,followup_history,record_no,"主键；310 个唯一；去重键"
+询盘跟进历史,记录时间（UTC）,followup_history,recorded_at,
+询盘跟进历史,记录类型,followup_history,record_type,"录入询盘 201 / 更新询盘 93 / 客户新回复 8 / 记录联系 8"
+询盘跟进历史,沟通内容,followup_history,content,
+中文背调,客户档案编号,followup_background,profile_no,"连接键；216 行与客户档案一一对应"
+中文背调,研究状态,followup_background,research_status,
+中文背调,公司中文介绍,followup_background,company_intro_cn,
+中文背调,主营业务,followup_background,business,
+中文背调,Neoprene 业务匹配,followup_background,neoprene_match,
+中文背调,未核实事项,followup_background,unverified_items,
+中文背调,研究时间（UTC）,followup_background,researched_at,
+背调来源,客户档案编号,followup_sources,profile_no,"连接键；525 条；只覆盖 129 位客户"
+背调来源,来源标题,followup_sources,title,
+背调来源,来源网址,followup_sources,url,
+背调来源,来源支持的结论,followup_sources,conclusion,
+关联社媒,客户档案编号,followup_social,profile_no,"连接键；157 条；只覆盖 82 位客户"
+关联社媒,平台,followup_social,platform,
+关联社媒,主页网址,followup_social,url,
+关联社媒,关联类型,followup_social,link_type,
+关联社媒,关联依据,followup_social,basis,
+关联社媒,公开简介,followup_social,bio,
+关联社媒,依据网址,followup_social,basis_url,
+关联社媒,记录来源,followup_social,record_source,
+官网提取记录,客户档案编号,followup_website_extracts,profile_no,"连接键；18 条；仅 3 位客户"
+官网提取记录,记录类型,followup_website_extracts,record_type,
+官网提取记录,标题 / 状态,followup_website_extracts,title_status,
+官网提取记录,内容,followup_website_extracts,content,
+官网提取记录,来源网址,followup_website_extracts,source_url,
+官网提取记录,核实范围 / 时间,followup_website_extracts,scope,
+导出说明,—,—,—,"不导入；内容已记入 IMPORT.md（导出范围 / 时间 / 重新导入说明）"
