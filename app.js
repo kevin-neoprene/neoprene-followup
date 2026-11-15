@@ -855,7 +855,7 @@ function loadAll() {
       $('syncStatus').textContent = '上次同步：' + new Date(state.syncState.last_sync_at).toLocaleString('zh-CN') +
         (state.syncState.last_error ? '（上次同步有报错：' + state.syncState.last_error + '）' : '');
     }
-    setStatus('数据保存在 Supabase，换设备打开也会同步。客户 ' + state.customers.length + ' 位，询盘 ' + state.inquiries.length + ' 条。');
+    setStatus(''); // 加载完成后不留说明行；同步/导出等操作仍用这行短暂提示结果
     renderAll();
   }).catch(function (e) {
     // 任一表加载失败：只报错，不用假数据填充，避免把示例当成真实数据。
@@ -892,9 +892,9 @@ function init() {
   $('addCustomerBtn').addEventListener('click', addCustomer);
   document.addEventListener('click', function (e) {
     var t = e.target;
-    if (t.dataset.editInquiry) { editingId = t.dataset.editInquiry; renderFollowList(); return; }
+    if (t.dataset.editInquiry) { editingId = t.dataset.editInquiry; renderAll(); return; }
     if (t.dataset.saveInquiry) { saveInquiry(t.dataset.saveInquiry); return; }
-    if (t.dataset.cancelEdit) { editingId = null; renderFollowList(); return; }
+    if (t.dataset.cancelEdit) { editingId = null; renderAll(); return; }
     if (t.dataset.confirmInquiryReview) {
       var card = t.closest('.review-card');
       if (card) confirmInquiryReview(t.dataset.confirmInquiryReview, card);
