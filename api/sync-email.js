@@ -180,12 +180,26 @@ function fetchHeaders(imap, simpleParser, boxName, sinceDate) {
         fetch.on('message', function (msg) {
           pending++;
           var raw = '';
+          var uid = null;
+          var parsedHeader = null;
+          var bodyDone = false;
+          var attrsDone = false;
+          function maybePush() {
+            // 信头解析和 UID（attributes 事件）都到了才入列；任一不到就等，
+            // 超时由外层 FETCH_TIMEOUT_MS 兜底，不无限挂起。
+            if (!bodyDone || !attrsDone) return;
+            if (parsedHeader) headers.push({ uid: uid, messageId: parsedHeader.messageId, date: parsedHeader.date, from: parsedHeader.from, to: parsedHeader.to, subject: parsedHeader.subject, inReplyTo: parsedHeader.inReplyTo, refs: parsedHeader.refs });
+            pending--;
+            if (pending === 0) finish(null, headers);
+          }
+          // node-imap 的 UID 不在 msg.uid 上，只能从 attributes 事件取（attrs.uid）。
+          // 旧版误用 msg.uid 恒为 undefined，导致正文拉取的 UID 全被过滤掉、0 封入库。
+          msg.once('attributes', function (attrs) { uid = attrs.uid; attrsDone = true; maybePush(); });
           msg.on('body', function (stream) {
             stream.on('data', function (chunk) { raw += chunk.toString('utf8'); });
             stream.once('end', function () {
               simpleParser(raw).then(function (parsed) {
-                headers.push({
-                  uid: msg.uid || null,
+                parsedHeader = {
                   messageId: String(parsed.messageId || '').trim(),
                   date: parsed.date ? new Date(parsed.date) : null,
                   from: addrOf(parsed.from),
@@ -193,13 +207,11 @@ function fetchHeaders(imap, simpleParser, boxName, sinceDate) {
                   subject: String(parsed.subject || ''),
                   inReplyTo: String(parsed.inReplyTo || ''),
                   refs: String(parsed.references || '')
-                });
+                };
               }).catch(function () {
                 // 信头解析失败的跳过：正文阶段不会再拉它，下次同步仍会重试
-              }).finally(function () {
-                pending--;
-                if (pending === 0) finish(null, headers);
-              });
+                parsedHeader = null;
+              }).finally(function () { bodyDone = true; maybePush(); });
             });
           });
         });
