@@ -71,6 +71,7 @@ var searchText = '';
 var customerSearchText = '';
 var allSearchText = '';
 var editingId = null; // 正在行内编辑的询盘 id
+var lastSyncSummaryText = ''; // 本次会话刚同步完的完整结果行；loadAll 刷新时保留它，不被“上次同步”盖掉
 
 // ---------- 纯函数（不碰 DOM；Node 下可通过 module.exports 单独测试） ----------
 function esc(s) {
@@ -816,9 +817,12 @@ function syncEmail() {
     .then(function (r) {
       if (r.ok) {
         var s = r.body || {};
-        $('syncStatus').textContent = '上次同步：' + new Date().toLocaleString('zh-CN') +
+        lastSyncSummaryText = '上次同步：' + new Date().toLocaleString('zh-CN') +
           '，拉取 ' + (s.fetched || 0) + ' 封，新增 ' + (s.new || 0) + ' 封，匹配到客户 ' +
-          (s.matched || 0) + ' 封，待判断 ' + (s.needs_review || 0) + ' 封。';
+          (s.matched || 0) + ' 封，待判断 ' + (s.needs_review || 0) + ' 封' +
+          '，自动停待办 ' + (s.auto_stopped || 0) + ' 条，建待办 ' + (s.todos_created || 0) + ' 条' +
+          ((s.errors && s.errors.length) ? '。（提示：' + s.errors.join('；') + '）' : '。');
+        $('syncStatus').textContent = lastSyncSummaryText;
         setStatus('邮箱同步完成，正在刷新列表……');
         loadAll();
       } else {
@@ -864,7 +868,10 @@ function loadAll() {
     state.inquiries = results[1] || [];
     state.emails = results[2] || [];
     state.syncState = (results[3] && results[3][0]) || null;
-    if (state.syncState && state.syncState.last_sync_at) {
+    // 本次会话刚同步过：保留同步结果的完整数字，不被这里的“上次同步”一行盖掉
+    // （旧版盖掉后页面上只剩一行，看不到拉取/新增/匹配/待判断的分项数字）。
+    if (lastSyncSummaryText) { $('syncStatus').textContent = lastSyncSummaryText; }
+    else if (state.syncState && state.syncState.last_sync_at) {
       $('syncStatus').textContent = '上次同步：' + new Date(state.syncState.last_sync_at).toLocaleString('zh-CN') +
         (state.syncState.last_error ? '（上次同步有报错：' + state.syncState.last_error + '）' : '');
     }
