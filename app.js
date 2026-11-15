@@ -69,6 +69,7 @@ var currentView = 'workbench';
 var currentFilter = 'all';
 var searchText = '';
 var customerSearchText = '';
+var allSearchText = '';
 var editingId = null; // 正在行内编辑的询盘 id
 
 // ---------- 纯函数（不碰 DOM；Node 下可通过 module.exports 单独测试） ----------
@@ -378,8 +379,9 @@ function renderCards() {
   $('cardOverdue').textContent = cards.overdue;
   $('cardReview').textContent = cards.review;
   $('cardWaiting').textContent = cards.waiting;
-  $('customerCount').textContent = state.customers.length ? '（' + state.customers.length + '）' : '';
-  $('reviewCount').textContent = cards.review ? '（' + cards.review + '）' : '';
+  $('customerCount').textContent = state.customers.length || '';
+  $('reviewCount').textContent = cards.review || '';
+  $('allCount').textContent = state.inquiries.length || '';
   // 空态：未导入真实数据时显示导入提示条
   var empty = state.customers.length === 0 && state.inquiries.length === 0;
   $('importBanner').classList.toggle('hidden', !empty);
@@ -418,6 +420,39 @@ function filteredInquiries() {
   return rows;
 }
 
+// 一条询盘的 4 列表格行（客户/询盘需求 | 阶段与回复 | 下一步动作 | 下次跟进）。
+// 跟进清单与全部询盘共用：行内编辑（编辑跟进 / 保存 / 取消）两边都能用。
+function inquiryRowHtml(r) {
+  var inq = r.inq, cust = r.cust || {};
+  var lastEmail = null;
+  state.emails.forEach(function (e) { if (String(e.inquiry_id) === String(inq.id)) lastEmail = e; });
+  var html = '<tr><td><div class="c-name">' + esc(cust.company || cust.name || '未知客户') + '</div>' +
+    '<div class="c-sub">' + esc(cust.name || '') + (cust.email ? ' · ' + esc(cust.email) : '') + '</div>' +
+    '<div class="c-sub">' + esc(inq.product || '') + (inq.product_category ? ' · ' + esc(inq.product_category) : '') + (inq.quantity ? ' · ' + esc(inq.quantity) : '') + '</div>' +
+    '<div class="row-actions"><button class="small ghost" data-edit-inquiry="' + esc(inq.id) + '">编辑跟进</button></div></td>' +
+    '<td><span class="badge ' + (STATUS_BADGE[r.key] || 'pending') + '">' + esc(STATUS_LABELS[r.key] || r.key) + '</span>' + replyBadge(inq) +
+    (inq.stage ? '<div class="c-sub" style="margin-top:6px">阶段：' + esc(inq.stage) + '</div>' : '') +
+    (lastEmail ? '<div class="c-sub">最新回复：' + esc(lastEmail.subject || '') + '（' + esc(INTENT_LABELS[lastEmail.intent] || lastEmail.intent) + '）</div>' : '') +
+    (inq.reply_snippet ? '<div class="c-sub">最近回复：' + esc(inq.reply_snippet) + '</div>' : '') +
+    '</td>' +
+    '<td>' + esc(inq.next_action || cust.next_action || '—') + '</td>' +
+    '<td>' + esc(fmtDate(inq.next_followup_at)) + '</td></tr>';
+  if (editingId === String(inq.id)) {
+    html += '<tr class="edit-row"><td colspan="4">' +
+      '<label class="muted">当前阶段</label><select id="editStage">' +
+      STAGES.map(function (s) {
+        return '<option value="' + esc(s) + '"' + (s === inq.stage ? ' selected' : '') + '>' + esc(s) + '</option>';
+      }).join('') + '</select>' +
+      '<label class="muted">下一步动作</label><input type="text" id="editAction" value="' + esc(inq.next_action || '') + '" placeholder="例如：跟进客户是否提供收货地址">' +
+      '<label class="muted">下次跟进日期</label><input type="date" id="editNext" value="' + esc(fmtDate(inq.next_followup_at) === '—' ? '' : fmtDate(inq.next_followup_at)) + '">' +
+      // v3：写跟进默认同时建待办（默认勾选，到期日 = 下次跟进日期，未填则今天 +3 天）
+      '<label class="todo-check"><input type="checkbox" id="editCreateTodo" checked> 同时创建待办（到期 ' + esc(fmtDate(inq.next_followup_at) === '—' ? addDays(todayStr(), DEFAULT_TODO_DAYS) : fmtDate(inq.next_followup_at)) + '）</label>' +
+      '<div class="row-actions"><button class="small" data-save-inquiry="' + esc(inq.id) + '">保存</button>' +
+      '<button class="small ghost" data-cancel-edit>取消</button></div></td></tr>';
+  }
+  return html;
+}
+
 function renderFollowList() {
   var el = $('followList');
   var rows = filteredInquiries();
@@ -428,35 +463,42 @@ function renderFollowList() {
     return;
   }
   var html = '<table class="follow-table"><thead><tr><th>客户 / 询盘需求</th><th>阶段与回复</th><th>下一步动作</th><th>下次跟进</th></tr></thead><tbody>';
-  rows.forEach(function (r) {
-    var inq = r.inq, cust = r.cust || {};
-    var lastEmail = null;
-    state.emails.forEach(function (e) { if (String(e.inquiry_id) === String(inq.id)) lastEmail = e; });
-    html += '<tr><td><div class="c-name">' + esc(cust.company || cust.name || '未知客户') + '</div>' +
-      '<div class="c-sub">' + esc(cust.name || '') + (cust.email ? ' · ' + esc(cust.email) : '') + '</div>' +
-      '<div class="c-sub">' + esc(inq.product || '') + (inq.product_category ? ' · ' + esc(inq.product_category) : '') + (inq.quantity ? ' · ' + esc(inq.quantity) : '') + '</div>' +
-      '<div class="row-actions"><button class="small ghost" data-edit-inquiry="' + esc(inq.id) + '">编辑跟进</button></div></td>' +
-      '<td><span class="badge ' + (STATUS_BADGE[r.key] || 'pending') + '">' + esc(STATUS_LABELS[r.key] || r.key) + '</span>' + replyBadge(inq) +
-      (inq.stage ? '<div class="c-sub" style="margin-top:6px">阶段：' + esc(inq.stage) + '</div>' : '') +
-      (lastEmail ? '<div class="c-sub">最新回复：' + esc(lastEmail.subject || '') + '（' + esc(INTENT_LABELS[lastEmail.intent] || lastEmail.intent) + '）</div>' : '') +
-      (inq.reply_snippet ? '<div class="c-sub">最近回复：' + esc(inq.reply_snippet) + '</div>' : '') +
-      '</td>' +
-      '<td>' + esc(inq.next_action || cust.next_action || '—') + '</td>' +
-      '<td>' + esc(fmtDate(inq.next_followup_at)) + '</td></tr>';
-    if (editingId === String(inq.id)) {
-      html += '<tr class="edit-row"><td colspan="4">' +
-        '<label class="muted">当前阶段</label><select id="editStage">' +
-        STAGES.map(function (s) {
-          return '<option value="' + esc(s) + '"' + (s === inq.stage ? ' selected' : '') + '>' + esc(s) + '</option>';
-        }).join('') + '</select>' +
-        '<label class="muted">下一步动作</label><input type="text" id="editAction" value="' + esc(inq.next_action || '') + '" placeholder="例如：跟进客户是否提供收货地址">' +
-        '<label class="muted">下次跟进日期</label><input type="date" id="editNext" value="' + esc(fmtDate(inq.next_followup_at) === '—' ? '' : fmtDate(inq.next_followup_at)) + '">' +
-        // v3：写跟进默认同时建待办（默认勾选，到期日 = 下次跟进日期，未填则今天 +3 天）
-        '<label class="todo-check"><input type="checkbox" id="editCreateTodo" checked> 同时创建待办（到期 ' + esc(fmtDate(inq.next_followup_at) === '—' ? addDays(todayStr(), DEFAULT_TODO_DAYS) : fmtDate(inq.next_followup_at)) + '）</label>' +
-        '<div class="row-actions"><button class="small" data-save-inquiry="' + esc(inq.id) + '">保存</button>' +
-        '<button class="small ghost" data-cancel-edit>取消</button></div></td></tr>';
-    }
+  rows.forEach(function (r) { html += inquiryRowHtml(r); });
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+// 全部询盘：不按状态过滤，终态（暂缓/已关闭/已成交）也在内，201 条全列出；
+// 直接读已加载的同一批询盘，不新增 Supabase 查询，与跟进清单用同一张 4 列表格。
+function allInquiries() {
+  var t = todayStr();
+  var rows = state.inquiries.map(function (inq) {
+    return { inq: inq, cust: customerById(inq.customer_id), key: computeInquiryStatus(inq, customerById(inq.customer_id), t) };
   });
+  if (allSearchText) {
+    var q = allSearchText.toLowerCase();
+    rows = rows.filter(function (r) {
+      return ((r.cust && (r.cust.name || '') + ' ' + (r.cust.company || '') + ' ' + (r.cust.email || '')) + ' ' + (r.inq.product || '') + ' ' + (r.inq.product_category || '')).toLowerCase().indexOf(q) !== -1;
+    });
+  }
+  rows.sort(function (a, b) {
+    var da = a.inq.next_followup_at || '9999', db = b.inq.next_followup_at || '9999';
+    return da < db ? -1 : da > db ? 1 : 0;
+  });
+  return rows;
+}
+
+function renderAllInquiries() {
+  var el = $('allList');
+  var rows = allInquiries();
+  $('allListCount').textContent = '（' + rows.length + ' 条）';
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty">暂无询盘记录。' +
+      (state.inquiries.length === 0 ? '请先按 README 第 5 步导入旧站导出文件（216 位客户 / 201 条询盘）。' : '') + '</div>';
+    return;
+  }
+  var html = '<table class="follow-table"><thead><tr><th>客户 / 询盘需求</th><th>阶段与回复</th><th>下一步动作</th><th>下次跟进</th></tr></thead><tbody>';
+  rows.forEach(function (r) { html += inquiryRowHtml(r); });
   html += '</tbody></table>';
   el.innerHTML = html;
 }
@@ -550,6 +592,7 @@ function renderReview() {
 function renderAll() {
   renderCards();
   renderFollowList();
+  renderAllInquiries();
   renderTodos();
   renderCustomers();
   renderReview();
@@ -826,11 +869,11 @@ function loadAll() {
 // ---------- 初始化 ----------
 function init() {
   renderDate();
-  $('tabs').addEventListener('click', function (e) {
+  $('sideNav').addEventListener('click', function (e) {
     var b = e.target.closest('[data-view]');
     if (!b) return;
     currentView = b.dataset.view;
-    document.querySelectorAll('#tabs .tab').forEach(function (x) { x.classList.toggle('active', x === b); });
+    document.querySelectorAll('#sideNav .nav-item').forEach(function (x) { x.classList.toggle('active', x === b); });
     document.querySelectorAll('.tabpane').forEach(function (p) { p.classList.toggle('active', p.id === 'pane-' + currentView); });
   });
   $('filterTabs').addEventListener('click', function (e) {
@@ -841,6 +884,7 @@ function init() {
     renderFollowList();
   });
   $('searchBox').addEventListener('input', function () { searchText = $('searchBox').value.trim(); renderFollowList(); });
+  $('searchAll').addEventListener('input', function () { allSearchText = $('searchAll').value.trim(); renderAllInquiries(); });
   $('searchCustomers').addEventListener('input', function () { customerSearchText = $('searchCustomers').value.trim(); renderCustomers(); });
   $('syncBtn').addEventListener('click', syncEmail);
   $('exportBtn').addEventListener('click', exportCsv);
