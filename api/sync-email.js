@@ -1,0 +1,493 @@
+// POST /api/sync-email — 邮箱同步（Vercel Serverless Function）
+// 邮箱：yunyou.top（西部数码云邮），IMAP imap.yunyou.top:993 SSL，SMTP smtp.yunyou.top:465/587。
+// IMAP 用邮箱登录密码（用户 2026-11-15 确认：没有单独的客户端授权码）。
+// 密码绝不写进代码、绝不打印日志：只从环境变量 IMAP_PASS 读。
+//
+// 环境变量（Vercel 项目设置里填）：
+//   IMAP_HOST=imap.yunyou.top            IMAP_PORT=993
+//   IMAP_USER=kevin@neoprenecustom.com   IMAP_PASS=<登录密码，仅存 Vercel，不进仓库>
+//   SUPABASE_URL=https://gplkvdodbfzknyafdttb.supabase.co
+//   SUPABASE_SERVICE_ROLE_KEY=<service_role key，仅服务端用，绝不用 anon key 代替写操作>
+//   SYNC_DAYS=90                         （可选：每次往回扫多少天，默认 90）
+//
+// 依赖（见 package.json，部署时 npm install）：imap、mailparser。
+// 本文件顶部不 require 它们：缺依赖时返回 501 + 明确提示，而不是部署即崩。
+// 同步是只读的：IMAP 以只读方式开箱，不删、不移、不标已读；写操作只发生在自家 Supabase。
+//
+// 返回 JSON：{ fetched, new, matched, needs_review, auto_stopped, todos_created, errors }
+//   fetched      本次从邮箱拉到的邮件数（含已在库里的）
+//   new          本次新写入 followup_emails 的数（按 Message-ID 去重）
+//   matched      新邮件里匹配到已有客户/询盘的数
+//   needs_review 新邮件里 intent=auto_unknown、需人工判断的数
+//   auto_stopped v3 回信自动停：客户一回信，自动停掉的未完成跟进待办条数
+//   todos_created v3：你发出的跟进邮件，每封默认建一条 +3 天的待办（与前端写跟进一致）
+
+'use strict';
+
+// ---------- 保守分类：只有能确定的才自动定意向，其余一律 auto_unknown 进人工池 ----------
+// 高置信度只给 4 种：bounce（退信）/ unsubscribe（退订）/ reject（明确拒绝）/ demand（明确下单）。
+// “要报价 / 要样品 / 问价格”这类只做提示，不自动改状态 —— 见 README 的说明。
+function classifyEmail(subject, body, fromAddress) {
+  var from = String(fromAddress || '').toLowerCase();
+  var text = String(subject || '') + '\n' + String(body || '');
+  var low = text.toLowerCase();
+  if (from.indexOf('mailer-daemon') !== -1 || from.indexOf('postmaster') !== -1 ||
+      low.indexOf('delivery status notification') !== -1 ||
+      low.indexOf('mail delivery failed') !== -1 ||
+      low.indexOf('undeliverable') !== -1 ||
+      low.indexOf('address not found') !== -1) {
+    return { intent: 'bounce', confidence: 'high' };
+  }
+  if (/\bunsubscribe\b/.test(low) || low.indexOf('please remove me') !== -1 ||
+      low.indexOf('stop sending me emails') !== -1) {
+    return { intent: 'unsubscribe', confidence: 'high' };
+  }
+  if (low.indexOf('not interested') !== -1 || low.indexOf('no longer interested') !== -1 ||
+      low.indexOf('do not contact') !== -1 || low.indexOf('please do not email') !== -1 ||
+      low.indexOf('decided not to proceed') !== -1 ||
+      low.indexOf('chosen another supplier') !== -1 ||
+      low.indexOf('not proceed with') !== -1) {
+    return { intent: 'reject', confidence: 'high' };
+  }
+  if (low.indexOf('confirm the order') !== -1 || low.indexOf('confirmed the order') !== -1 ||
+      low.indexOf('proceed with the order') !== -1 ||
+      low.indexOf('place an order') !== -1 ||
+      low.indexOf('please send the proforma invoice') !== -1 ||
+      low.indexOf('payment has been made') !== -1 ||
+      low.indexOf('we have made the payment') !== -1) {
+    return { intent: 'demand', confidence: 'high' };
+  }
+  return { intent: 'auto_unknown', confidence: 'low' };
+}
+
+function snippetOf(text, n) {
+  var s = String(text || '').replace(/\s+/g, ' ').trim();
+  return s.length > (n || 200) ? s.slice(0, n || 200) + '…' : s;
+}
+function addrOf(parsedAddr) {
+  // mailparser 的地址对象：{ text, value: [{ address, name }] }
+  if (!parsedAddr) return '';
+  if (typeof parsedAddr === 'string') return parsedAddr;
+  if (parsedAddr.value && parsedAddr.value[0]) return parsedAddr.value[0].address || '';
+  if (parsedAddr.address) return parsedAddr.address;
+  return String(parsedAddr.text || '');
+}
+function nameOf(parsedAddr) {
+  if (!parsedAddr || typeof parsedAddr === 'string') return '';
+  if (parsedAddr.value && parsedAddr.value[0]) return parsedAddr.value[0].name || '';
+  return '';
+}
+function imapDate(d) {
+  // node-imap 的 SINCE 要 "DD-Mon-YYYY"，如 "17-Aug-2026"
+  var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return d.getDate() + '-' + months[d.getMonth()] + '-' + d.getFullYear();
+}
+function addDaysStr(dateStr, n) {
+  var d = new Date(String(dateStr).slice(0, 10) + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+// ---------- Supabase REST（服务端用 service_role key；不用浏览器 anon key） ----------
+function makeSb(baseUrl, serviceKey) {
+  function call(table, opts) {
+    opts = opts || {};
+    var url = baseUrl + '/rest/v1/' + table;
+    if (opts.query) url += '?' + opts.query;
+    if (opts.id) url += '?id=eq.' + encodeURIComponent(opts.id);
+    return fetch(url, {
+      method: opts.method || 'GET',
+      headers: {
+        apikey: serviceKey,
+        Authorization: 'Bearer ' + serviceKey,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation'
+      },
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    }).then(function (res) {
+      if (!res.ok) return res.text().then(function (t) { throw new Error('Supabase ' + table + ' HTTP ' + res.status + ' ' + t.slice(0, 200)); });
+      return res.text().then(function (t) { return t ? JSON.parse(t) : null; });
+    });
+  }
+  return {
+    list: function (table, query) { return call(table, { query: query || 'select=*' }); },
+    insert: function (table, row) { return call(table, { method: 'POST', body: row }); },
+    update: function (table, id, patch) { return call(table, { method: 'PATCH', id: id, body: patch }); },
+    // 按条件批量 PATCH（回信自动停用）：PATCH /rest/v1/<表>?<条件>，返回被改的行
+    updateWhere: function (table, query, patch) {
+      return fetch(baseUrl + '/rest/v1/' + table + '?' + query, {
+        method: 'PATCH',
+        headers: {
+          apikey: serviceKey,
+          Authorization: 'Bearer ' + serviceKey,
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation'
+        },
+        body: JSON.stringify(patch)
+      }).then(function (res) {
+        if (!res.ok) return res.text().then(function (t) { throw new Error('Supabase ' + table + ' HTTP ' + res.status + ' ' + t.slice(0, 200)); });
+        return res.text().then(function (t) { return t ? JSON.parse(t) : []; });
+      });
+    },
+    upsertSyncState: function (patch) {
+      // followup_sync_state 只有 id=1 一行
+      return call('followup_sync_state', { method: 'PATCH', id: 1, body: patch });
+    }
+  };
+}
+
+// ---------- IMAP：只读拉取一个文件夹的邮件 ----------
+function fetchFolder(imap, simpleParser, boxName, sinceDate, readOnly) {
+  return new Promise(function (resolve, reject) {
+    imap.openBox(boxName, !!readOnly, function (err) {
+      if (err) return reject(new Error('打不开邮箱文件夹 ' + boxName + '：' + err.message));
+      imap.search([['SINCE', imapDate(sinceDate)]], function (err2, results) {
+        if (err2) return reject(new Error('搜索 ' + boxName + ' 失败：' + err2.message));
+        if (!results || !results.length) return resolve([]);
+        var fetch = imap.fetch(results, { bodies: '', markSeen: false });
+        var mails = [];
+        var pending = 0;
+        var done = false;
+        fetch.on('message', function (msg) {
+          pending++;
+          var raw = '';
+          msg.on('body', function (stream) {
+            stream.on('data', function (chunk) { raw += chunk.toString('utf8'); });
+            stream.once('end', function () {
+              simpleParser(raw).then(function (parsed) {
+                mails.push(parsed);
+              }).catch(function (e) {
+                mails.push({ _parseError: e.message, _rawSnippet: raw.slice(0, 500) });
+              }).finally(function () {
+                pending--;
+                if (pending === 0 && !done) { done = true; resolve(mails); }
+              });
+            });
+          });
+        });
+        fetch.once('error', function (e) { if (!done) { done = true; reject(new Error('拉取 ' + boxName + ' 失败：' + e.message)); } });
+        fetch.once('end', function () {
+          // 还有正在解析的邮件时等它们；没有则直接返回
+          if (pending === 0 && !done) { done = true; resolve(mails); }
+        });
+      });
+    });
+  });
+}
+
+function connectImap(Imap, cfg) {
+  return new Promise(function (resolve, reject) {
+    var imap = new Imap({
+      user: cfg.user,
+      password: cfg.pass, // 只从环境变量来；此处绝不打印
+      host: cfg.host,
+      port: cfg.port,
+      tls: true,
+      tlsOptions: { rejectUnauthorized: true },
+      connTimeout: 15000,
+      authTimeout: 10000
+    });
+    imap.once('ready', function () { resolve(imap); });
+    imap.once('error', function (err) { reject(new Error('IMAP 连接失败（' + cfg.host + ':' + cfg.port + '）：' + err.message + '。请检查 Vercel 环境变量与网页邮箱里 IMAP 是否已开启。')); });
+    imap.connect();
+  });
+}
+
+// ---------- 主处理 ----------
+module.exports = async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'method_not_allowed', message: '请用 POST 调用 /api/sync-email' });
+    return;
+  }
+  var host = process.env.IMAP_HOST || 'imap.yunyou.top';
+  var port = parseInt(process.env.IMAP_PORT || '993', 10);
+  var user = process.env.IMAP_USER || 'kevin@neoprenecustom.com';
+  var pass = process.env.IMAP_PASS || '';
+  var sbUrl = process.env.SUPABASE_URL || 'https://gplkvdodbfzknyafdttb.supabase.co';
+  var serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  var syncDays = parseInt(process.env.SYNC_DAYS || '90', 10);
+
+  if (!pass) {
+    res.status(501).json({
+      error: 'email_not_configured',
+      message: '邮箱未连接：请在 Vercel 环境变量配置 IMAP_PASS（云邮登录密码）。IMAP_HOST=' + host + '，IMAP_USER=' + user + '。'
+    });
+    return;
+  }
+  if (!serviceKey) {
+    res.status(501).json({
+      error: 'email_not_configured',
+      message: '邮箱未连接：请在 Vercel 环境变量配置 SUPABASE_SERVICE_ROLE_KEY（服务端写库用，绝不要用 anon key）。'
+    });
+    return;
+  }
+
+  var Imap, simpleParser;
+  try {
+    Imap = require('imap'); // eslint-disable-line global-require
+    simpleParser = require('mailparser').simpleParser; // eslint-disable-line global-require
+  } catch (e) {
+    res.status(501).json({
+      error: 'missing_deps',
+      message: '邮箱同步依赖未安装：请在项目根目录执行 npm install（依赖 imap、mailparser），再重新部署。'
+    });
+    return;
+  }
+
+  var sb = makeSb(sbUrl, serviceKey);
+  var summary = { fetched: 0, new: 0, matched: 0, needs_review: 0, auto_stopped: 0, todos_created: 0, errors: [] };
+  var imap = null;
+  try {
+    // 1) 读库里已有的客户 / 邮件，建立匹配索引（v3：顺带读开发/已读计数，同步时 +1 用）
+    var customers = await sb.list('followup_customers', 'select=id,name,company,email,outreach_count,read_count');
+    var byEmail = {};
+    customers.forEach(function (c) { if (c.email) byEmail[String(c.email).trim().toLowerCase()] = c; });
+    var knownEmails = await sb.list('followup_emails', 'select=message_id,in_reply_to,refs,customer_id,inquiry_id,thread_id');
+    var knownIds = {};
+    var threadMap = {}; // message-id / in-reply-to / references token -> { customer_id, inquiry_id }
+    knownEmails.forEach(function (e) {
+      if (e.message_id) { knownIds[e.message_id] = true; threadMap[e.message_id] = e; }
+      if (e.in_reply_to) threadMap[e.in_reply_to] = e;
+      String(e.refs || '').split(/\s+/).forEach(function (tok) { if (tok) threadMap[tok] = e; });
+    });
+
+    // 2) IMAP 只读拉取：收件箱 + 已发件（文件夹名按服务商可能不同，逐个试）
+    imap = await connectImap(Imap, { user: user, pass: pass, host: host, port: port });
+    var since = new Date();
+    since.setDate(since.getDate() - syncDays);
+    var inbox = await fetchFolder(imap, simpleParser, 'INBOX', since, true);
+    var sent = [];
+    var sentFolders = ['Sent', 'Sent Messages', '已发送'];
+    for (var i = 0; i < sentFolders.length; i++) {
+      try { sent = await fetchFolder(imap, simpleParser, sentFolders[i], since, true); break; }
+      catch (e) { /* 该名字不存在就试下一个 */ }
+    }
+    summary.fetched = inbox.length + sent.length;
+
+    // 3) 逐封处理
+    var jobs = [];
+    inbox.forEach(function (m) { jobs.push({ parsed: m, direction: 'in' }); });
+    sent.forEach(function (m) { jobs.push({ parsed: m, direction: 'out' }); });
+
+    for (var j = 0; j < jobs.length; j++) {
+      var parsed = jobs[j].parsed;
+      var direction = jobs[j].direction;
+      try {
+        if (!parsed || parsed._parseError) throw new Error('邮件解析失败：' + (parsed ? parsed._parseError : '空邮件'));
+        var messageId = String(parsed.messageId || '').trim();
+        if (!messageId) continue; // 没有 Message-ID 的无法去重，跳过
+        if (knownIds[messageId]) continue; // 已在库里，跳过
+        knownIds[messageId] = true;
+
+        var fromEmail = addrOf(parsed.from).toLowerCase();
+        var toList = parsed.to && parsed.to.value ? parsed.to.value.map(function (v) { return (v.address || '').toLowerCase(); }) : [];
+        var counterpart = direction === 'in' ? fromEmail : (toList[0] || '');
+        var subject = String(parsed.subject || '');
+        var bodyText = String(parsed.text || '');
+        var sentAt = parsed.date ? new Date(parsed.date).toISOString() : new Date().toISOString();
+        var inReplyTo = String(parsed.inReplyTo || '');
+        var refs = String(parsed.references || '');
+
+        // 匹配：先 In-Reply-To / References 对上已有往来，再按对方邮箱对上客户
+        var match = null;
+        if (inReplyTo && threadMap[inReplyTo]) match = threadMap[inReplyTo];
+        if (!match) {
+          var refTokens = refs.split(/\s+/).filter(Boolean);
+          for (var k = 0; k < refTokens.length && !match; k++) if (threadMap[refTokens[k]]) match = threadMap[refTokens[k]];
+        }
+        var customer = match && match.customer_id
+          ? customers.find(function (c) { return String(c.id) === String(match.customer_id); }) || null
+          : (byEmail[counterpart] || null);
+        var inquiryId = match ? match.inquiry_id : null;
+        var matched = !!(customer || inquiryId);
+
+        // 对不上任何客户：收到的新询盘自动建档；发出的也建档（是你主动联系的客户）
+        if (!customer && counterpart && counterpart.indexOf('@') !== -1 &&
+            counterpart !== user.toLowerCase()) {
+          var created = await sb.insert('followup_customers', {
+            name: nameOf(direction === 'in' ? parsed.from : parsed.to) || counterpart.split('@')[0],
+            company: '',
+            email: counterpart,
+            stage: '待处理',
+            // v3：新客户默认未验证、无线索标签、计数 0；验证与打标签在来发信/人工确认后补。
+            verification_status: 'unverified',
+            tags: [],
+            outreach_count: 0,
+            read_count: 0,
+            health_score: 50,
+            last_contact_at: sentAt,
+            next_action: '新客户来信，先确认公司与产品需求'
+          });
+          customer = created && created[0] ? created[0] : null;
+          if (customer) {
+            byEmail[counterpart] = customer;
+            customers.push(customer);
+            var inq = await sb.insert('followup_inquiries', {
+              customer_id: customer.id,
+              product: '',
+              summary: snippetOf(subject + ' ' + bodyText, 200),
+              status: '待处理',
+              stage: '新询盘',
+              reply_status: direction === 'in' ? '已回复 · 待判断' : '未回复 · 等待客户',
+              first_inquiry_at: sentAt,
+              last_reply_at: direction === 'in' ? sentAt : null,
+              next_action: '新客户来信，先确认公司与产品需求'
+            });
+            inquiryId = inq && inq[0] ? inq[0].id : null;
+          }
+        }
+        // 有客户但没有询盘：补一条询盘壳（后续人工补产品）
+        if (customer && !inquiryId) {
+          var existing = await sb.list('followup_inquiries',
+            'select=id&customer_id=eq.' + encodeURIComponent(customer.id) + '&order=created_at.desc&limit=1');
+          if (existing && existing[0]) {
+            inquiryId = existing[0].id;
+          } else {
+            var inq2 = await sb.insert('followup_inquiries', {
+              customer_id: customer.id, product: '', summary: snippetOf(subject, 200),
+              status: '待处理', stage: '新询盘',
+              reply_status: direction === 'in' ? '已回复 · 待判断' : '未回复 · 等待客户',
+              first_inquiry_at: sentAt,
+              last_reply_at: direction === 'in' ? sentAt : null,
+              next_action: '先看客户最新回复，再决定下一步'
+            });
+            inquiryId = inq2 && inq2[0] ? inq2[0].id : null;
+          }
+        }
+
+        // 分类：只有收到的信才需要判断；发出的信不需要
+        var cls = { intent: 'other', confidence: 'high' };
+        var needsReview = false;
+        if (direction === 'in') {
+          cls = classifyEmail(subject, bodyText, fromEmail);
+          needsReview = cls.intent === 'auto_unknown';
+        }
+
+        await sb.insert('followup_emails', {
+          customer_id: customer ? customer.id : null,
+          inquiry_id: inquiryId || null,
+          message_id: messageId,
+          thread_id: '',
+          in_reply_to: inReplyTo,
+          refs: refs,
+          direction: direction,
+          from_email: fromEmail,
+          to_email: toList.join(','),
+          subject: subject,
+          snippet: snippetOf(bodyText, 200),
+          body_text: String(bodyText || '').slice(0, 20000),
+          sent_at: sentAt,
+          intent: cls.intent,
+          intent_confidence: cls.confidence,
+          needs_review: needsReview
+        });
+        summary.new++;
+        if (matched) summary.matched++;
+        if (needsReview) summary.needs_review++;
+
+        // 更新跟进状态（保守：只改时间与下一步，不自动成交/丢单）
+        if (inquiryId) {
+          if (direction === 'in') {
+            // 待判断是 reply_status（原文口径），不是 status 桶：status 桶由日期 + stage 计算
+            await sb.update('followup_inquiries', inquiryId, {
+              last_reply_at: sentAt, reply_status: '已回复 · 待判断',
+              next_action: '先看新回复，再决定阶段', updated_at: new Date().toISOString()
+            });
+            // v3 回信自动停：客户一回信，该询盘下未完成的自动待办一次停掉，
+            // 并在跟进历史里留一行记录。注意：只停待办——回复仍是“已回复 · 待判断”，
+            // 绝不自动标为已处理，必须人工看一次。
+            try {
+              var stopped = await sb.updateWhere('followup_todos',
+                'inquiry_id=eq.' + encodeURIComponent(inquiryId) + '&done=eq.false',
+                { done: true, stopped_by_reply: true });
+              var stoppedN = Array.isArray(stopped) ? stopped.length : 0;
+              summary.auto_stopped += stoppedN;
+              if (stoppedN > 0) {
+                await sb.insert('followup_history', {
+                  customer_id: customer ? customer.id : null, inquiry_id: inquiryId,
+                  profile_no: '', inquiry_no: '', record_no: 'auto-stop-' + inquiryId + '-' + Date.now(),
+                  record_type: '回信自动停',
+                  content: '客户已回复，自动停止未完成的跟进待办 ' + stoppedN + ' 条；回复仍为“已回复 · 待判断”，待人工确认。',
+                  recorded_at: new Date().toISOString()
+                });
+              }
+            } catch (e) { summary.errors.push('回信自动停失败：' + e.message); }
+            // v3 阅读计数：收到一封匹配到的回复，read_count +1
+            if (customer) {
+              try {
+                await sb.update('followup_customers', customer.id, {
+                  read_count: (parseInt(customer.read_count, 10) || 0) + 1,
+                  last_contact_at: sentAt, updated_at: new Date().toISOString()
+                });
+                customer.read_count = (parseInt(customer.read_count, 10) || 0) + 1;
+              } catch (e) { summary.errors.push('阅读计数失败：' + e.message); }
+            }
+          } else {
+            await sb.update('followup_inquiries', inquiryId, {
+              next_followup_at: addDaysStr(sentAt, 3),
+              updated_at: new Date().toISOString()
+            });
+            // v3：你发出的跟进邮件默认建一条 +3 天的待办（与前端写跟进一致）；
+            // 指纹冲突（同一天已建过）时跳过，不报错。
+            try {
+              var todoDue = addDaysStr(sentAt, 3);
+              await sb.insert('followup_todos', {
+                customer_id: customer ? customer.id : null,
+                inquiry_id: inquiryId,
+                reason: '跟进邮件已发出：' + subject,
+                next_action: '等客户回复；' + todoDue + ' 前未回再跟进一次',
+                due_at: todoDue,
+                done: false,
+                stopped_by_reply: false,
+                fingerprint: 'sync-out|' + inquiryId + '|' + todoDue
+              });
+              summary.todos_created++;
+            } catch (e) { /* 指纹冲突即已建过，跳过 */ }
+            // v3 开发计数：发出一封跟进邮件，outreach_count +1
+            if (customer) {
+              try {
+                await sb.update('followup_customers', customer.id, {
+                  outreach_count: (parseInt(customer.outreach_count, 10) || 0) + 1,
+                  last_contact_at: sentAt, updated_at: new Date().toISOString()
+                });
+                customer.outreach_count = (parseInt(customer.outreach_count, 10) || 0) + 1;
+              } catch (e) { summary.errors.push('开发计数失败：' + e.message); }
+            }
+          }
+        } else if (customer) {
+          await sb.update('followup_customers', customer.id, {
+            last_contact_at: sentAt, updated_at: new Date().toISOString()
+          });
+        }
+      } catch (e) {
+        summary.errors.push(e.message);
+      }
+    }
+
+    // 4) 写同步状态（成功也写，供前端显示“上次同步”）
+    try {
+      await sb.upsertSyncState({
+        last_sync_at: new Date().toISOString(),
+        last_message_id: '',
+        last_error: summary.errors[0] || '',
+        provider: 'yunyou.top',
+        updated_at: new Date().toISOString()
+      });
+    } catch (e) { summary.errors.push('写同步状态失败：' + e.message); }
+
+    res.status(200).json(summary);
+  } catch (e) {
+    res.status(500).json({
+      error: 'sync_failed', message: e.message,
+      fetched: summary.fetched, new: summary.new, matched: summary.matched,
+      needs_review: summary.needs_review, auto_stopped: summary.auto_stopped,
+      todos_created: summary.todos_created, errors: summary.errors
+    });
+  } finally {
+    if (imap) { try { imap.end(); } catch (e) { /* 忽略关闭时的错误 */ } }
+  }
+};
+
+// Node 下测试用
+module.exports.classifyEmail = classifyEmail;
+module.exports.addDaysStr = addDaysStr;
