@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>客户跟进工作台 — Neoprene</title>
+<link rel="stylesheet" href="style.css">
+<!-- 不依赖任何外部 JS 库：Supabase 用 fetch 直调 REST API（与工作面板 v2 同一做法），CDN 卡住也不会白屏 -->
+<!-- config.js 由部署时从 config.example.js 复制而来，填入 Supabase URL 与 anon key；本地没有该文件时自动进入示例数据演示模式 -->
+<script src="config.js" onerror="window.FOLLOWUP_CONFIG_MISSING=true"></script>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>每一条询盘，都有下一步。</h1>
+      <p class="subtitle">从客户的真实反馈出发，把精力放在值得推进的对话上。</p>
+    </div>
+    <div class="date" id="today"></div>
+  </header>
+
+  <p class="status" id="status">加载中……</p>
+  <div class="import-banner" id="importBanner">
+    <b>待导入真实数据：旧系统导出 216 位客户 / 201 条询盘</b>（导出时间 2026-11-15 22:12）。
+    请先配置 Supabase（config.js），再按 README 第 5 步用 import/ 里的脚本导入；
+    导入后这里显示真实数据，4 张卡应为：今天应跟进 10 / 已逾期 106 / 回复待判断 122 / 等待客户 66。
+    注意：旧站首页曾显示 202 条询盘，导出文件为 201 条，差 1 条已在导入说明里标注，导入时不硬凑。
+  </div>
+
+  <div class="toolbar">
+    <button id="syncBtn">🔄 同步邮箱</button>
+    <button class="ghost" id="exportBtn">⬇ 导出 CSV（当前筛选，全部字段，每日上限 50,000 行）</button>
+    <button class="ghost" id="refreshBtn">刷新列表</button>
+    <span class="muted" id="syncStatus">邮箱：yunyou.top（IMAP imap.yunyou.top:993）· 同步需在 Vercel 部署后配置环境变量</span>
+  </div>
+
+  <!-- 顶部 4 张卡：数字全部由数据实时算出 -->
+  <div class="cards">
+    <div class="card-stat"><span>今天应跟进</span><b id="cardDue">0</b><small>按你确认的日期安排</small></div>
+    <div class="card-stat"><span>已逾期</span><b id="cardOverdue" class="overdue">0</b><small>重新判断，再安排下一步</small></div>
+    <div class="card-stat"><span>回复待判断</span><b id="cardReview">0</b><small>先看新回复，再决定阶段</small></div>
+    <div class="card-stat"><span>等待客户</span><b id="cardWaiting">0</b><small>保持耐心，不自动催单</small></div>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="workbench">跟进工作台</button>
+    <button class="tab" data-view="customers">客户档案 <span id="customerCount"></span></button>
+    <button class="tab" data-view="review">回复待判断 <span id="reviewCount"></span></button>
+  </nav>
+
+  <!-- 跟进工作台 -->
+  <section class="card tabpane active" id="pane-workbench">
+    <h2>跟进清单 <span class="muted" id="listCount"></span></h2>
+    <p class="muted">阶段由你判断，日期由你确认。逾期规则：只按“下次跟进日期过了今天”算，无日期即待定日期；7 天无互动只进下面的“今日待办建议”，不改卡片数字（可在 app.js 顶部改）。</p>
+    <div class="subtabs" id="filterTabs">
+      <button class="subtab active" data-filter="all">全部进行中</button>
+      <button class="subtab" data-filter="pending">待处理</button>
+      <button class="subtab" data-filter="due">今天应跟进</button>
+      <button class="subtab" data-filter="overdue">已逾期</button>
+      <button class="subtab" data-filter="waiting">等待客户</button>
+      <button class="subtab" data-filter="unscheduled">待定日期</button>
+    </div>
+    <div class="toolbar">
+      <input type="search" id="searchBox" placeholder="搜索客户、公司或产品…">
+    </div>
+    <div id="followList"><div class="empty">加载中……</div></div>
+
+    <h2 style="margin-top:22px">今日待办建议（最多 10 条）</h2>
+    <p class="muted">每天扫描一次：7 天无互动、健康度低于 60、缺下一步动作、已逾期未排下一步的客户才会出现在这里，每条都写清为什么。</p>
+    <div id="todoList"><div class="empty">加载中……</div></div>
+  </section>
+
+  <!-- 客户档案 -->
+  <section class="card tabpane" id="pane-customers">
+    <h2>客户档案</h2>
+    <div class="add-row form-grid" id="customerForm">
+      <input type="text" data-f="name" placeholder="客户姓名 *">
+      <input type="text" data-f="company" placeholder="公司">
+      <input type="email" data-f="email" placeholder="邮箱 *（用于匹配邮件）">
+      <input type="text" data-f="country" placeholder="国家">
+      <input type="text" data-f="phone" placeholder="电话">
+      <input type="text" data-f="product" placeholder="产品（新建询盘用）">
+      <input type="text" data-f="tags" placeholder="标签（逗号分隔，如 NEO-WS｜潜水服水上运动｜2026-08）">
+      <select data-f="verification_status" title="邮箱验证状态：只有 有效 / 未知 以后可群发（群发在来发信里做）">
+        <option value="unverified" selected>邮箱验证：未验证</option>
+        <option value="valid">邮箱验证：有效</option>
+        <option value="unknown">邮箱验证：未知</option>
+        <option value="verifying">邮箱验证：验证中</option>
+        <option value="invalid">邮箱验证：无效</option>
+      </select>
+      <button id="addCustomerBtn">添加客户</button>
+    </div>
+    <div class="toolbar">
+      <input type="search" id="searchCustomers" placeholder="搜索客户、公司或邮箱…">
+    </div>
+    <div id="customerList"><div class="empty">加载中……</div></div>
+  </section>
+
+  <!-- 回复待判断 -->
+  <section class="card tabpane" id="pane-review">
+    <h2>回复待判断</h2>
+    <p class="muted">待判断按询盘的“客户回复状态”计：导出文件里 126 条，排除暂缓 / 已关闭后为 122 条，与旧站首页一致。
+    邮箱同步后新到的回复也会出现在这里。只有系统能确定的（退信 / 退订 / 明确拒绝 / 明确下单）才会自动分类，其余一律人工判断。
+    点“确认”后，这条回复不再计入待判断，客户的下次跟进自动往后推 3 天。</p>
+    <div id="reviewList"><div class="empty">加载中……</div></div>
+  </section>
+
+  <p class="muted">数据来源：Supabase 项目 neoprene-order-assistant（复用，不新建项目）。邮箱同步：Vercel 后台函数 /api/sync-email，以只读方式拉取 kevin@neoprenecustom.com 的收件箱与已发件。</p>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
