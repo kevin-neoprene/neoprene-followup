@@ -448,7 +448,7 @@ function inquiryRowHtml(r) {
       // v3：写跟进默认同时建待办（默认勾选，到期日 = 下次跟进日期，未填则今天 +3 天）
       '<label class="todo-check"><input type="checkbox" id="editCreateTodo" checked> 同时创建待办（到期 ' + esc(fmtDate(inq.next_followup_at) === '—' ? addDays(todayStr(), DEFAULT_TODO_DAYS) : fmtDate(inq.next_followup_at)) + '）</label>' +
       '<div class="row-actions"><button class="small" data-save-inquiry="' + esc(inq.id) + '">保存</button>' +
-      '<button class="small ghost" data-cancel-edit>取消</button></div></td></tr>';
+      '<button class="small ghost" data-cancel-edit="1">取消</button></div></td></tr>';
   }
   return html;
 }
