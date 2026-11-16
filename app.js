@@ -915,15 +915,16 @@ function batchDeleteCustomers() {
 }
 
 // ---------- 客户档案：导入 / 导出 Excel ----------
-// SheetJS 只在第一次点导入/导出时才从 CDN 懒加载；页面本身不挂任何外部 JS，
-// CDN 挂了也不影响页面打开。导入 .csv 不需要 SheetJS，始终可用。
+// SheetJS 只在第一次点导入/导出时才懒加载；文件就放在本站同目录（xlsx.full.min.js，
+// SheetJS 0.18.5），不走 CDN——2026-11-16 实测 CDN 加载在浏览器里超过 60 秒没反应，
+// 改成本地文件后导入/导出不再依赖外网。页面本身平时不加载它。导入 .csv 不需要 SheetJS，始终可用。
 var sheetJsPromise = null;
 function loadSheetJS() {
   if (typeof window !== 'undefined' && window.XLSX) return Promise.resolve(window.XLSX);
   if (sheetJsPromise) return sheetJsPromise;
   sheetJsPromise = new Promise(function (resolve, reject) {
     var s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.src = 'xlsx.full.min.js';
     var done = false;
     var timer = setTimeout(function () { if (!done) { done = true; reject(new Error('加载超时（20 秒）')); } }, 20000);
     s.onload = function () {
