@@ -1071,10 +1071,15 @@ function allCustomerExportPairs() {
   return out;
 }
 // 导出全部客户 Excel：3 个工作表（客户档案 / 关联询盘 / 邮件沟通），一律是全部数据，
-// 不受下方搜索与筛选影响。CDN 失败时退回下载同名字段的 CSV，并明说。
+// 不受下方搜索与筛选影响。SheetJS 现在由 index.html 随页面一起加载（xlsx.full.min.js，
+// 本地文件），导出时直接同步生成，不再动态注入脚本、不再等定时器——2026-11-16 实测
+// 动态加载那一路在浏览器里会一直卡在“正在准备导出……”上（20 秒兜底定时器也不触发）。
+// 如果表格组件万一没加载进来，立刻退回下载同名字段的 CSV，并明说。
 function exportCustomersExcel() {
   setCustomerStatus('正在准备导出全部客户……');
-  loadSheetJS().then(function (XLSX) {
+  if (typeof window !== 'undefined' && window.XLSX) {
+    try {
+      var XLSX = window.XLSX;
     var byId = {};
     state.customers.forEach(function (c) { byId[c.id] = c; });
     var inqNoById = {};
@@ -1127,7 +1132,15 @@ function exportCustomersExcel() {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(mailRows), '邮件沟通');
     XLSX.writeFile(wb, '客户档案-' + todayStr() + '.xlsx');
     setCustomerStatus('已导出全部 ' + state.customers.length + ' 位客户（客户档案 / 关联询盘 / 邮件沟通 3 个工作表，不受筛选影响）。');
-  }).catch(function () {
+    return;
+    } catch (e) {
+      // 生成失败也退回 CSV，不卡住
+    }
+  }
+  exportCustomersCsvFallback();
+}
+
+function exportCustomersCsvFallback() {
     var csv = buildExportCsv(allCustomerExportPairs());
     var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
     var a = document.createElement('a');
@@ -1137,8 +1150,7 @@ function exportCustomersExcel() {
     a.click();
     document.body.removeChild(a);
     setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
-    setCustomerStatus('表格组件未能从 CDN 加载，已改为导出 CSV（全部 ' + state.customers.length + ' 位客户，字段相同），请检查下载。', true);
-  });
+    setCustomerStatus('表格组件未能加载，已改为导出 CSV（全部 ' + state.customers.length + ' 位客户，字段相同），请检查下载。', true);
 }
 
 function renderReview() {
