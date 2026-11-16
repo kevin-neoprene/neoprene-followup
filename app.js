@@ -30,6 +30,13 @@ var MAX_TODOS_PER_RUN = 10;
 var HEALTH_LOW = 60;
 // 终态阶段：不计入“全部进行中”（旧站：194 = 201 − 暂缓 3 − 已关闭 3 − 已成交 1）
 var TERMINAL_STAGES = ['已成交', '已关闭', '暂缓'];
+// ---------- 项目与订单 / 经营汇总（与旧站经营汇总口径一致，见统计口径表） ----------
+// 确认阶段：substring 匹配——“订单确认·返单”算确认，“打样·返单”不算。
+// 45 条订单里确认 26 条；2026-11 有 2 笔（Kevin261031、kevin261102）。
+var CONFIRMED_STAGE_KEYS = ['订单确认', '采购', '已出货', '已完成'];
+// 订单阶段原文（45 条里实际出现的 9 个值；新建表单无数据时用这份兜底）。
+var ORDER_STAGES = ['订单确认', '打样', '需求/报价', '采购/生产', '已出货', '已完成',
+  '订单确认·返单', '打样·返单', '需求/报价·已签收'];
 
 // ---------- Supabase 配置（从 config.js 读；部署时由 config.example.js 复制而来） ----------
 // 同一个 Supabase 项目：neoprene-order-assistant（免费版已满 2 个项目，不新建，复用）
@@ -64,12 +71,29 @@ var DB_STATUS_TO_KEY = {
   '待定日期': 'unscheduled', '回复待判断': 'review', '已成交': 'done', '已丢单': 'lost', '归档': 'archived'
 };
 
-var state = { customers: [], inquiries: [], emails: [], syncState: null };
+var state = { customers: [], inquiries: [], emails: [], syncState: null, orders: [], suppliers: [], history: [] };
 var currentView = 'workbench';
 var currentFilter = 'all';
 var searchText = '';
 var customerSearchText = '';
 var allSearchText = '';
+// 项目与订单页筛选（类型 = 阶段在“·”之前的部分，如“订单确认·返单”属“订单确认”）
+var orderTypeFilter = '';
+var orderCustomerFilter = '';
+var orderStageFilter = '';
+var orderSearchText = '';
+var orderFilterSig = ''; // 类型/客户/阶段下拉选项的签名，数据不变时不重建选项
+// 供应商与物流页筛选
+var supplierSearchText = '';
+var supplierKindFilter = '';
+// 经营汇总页月份（默认取数据里最晚的有活动月份）
+var summaryMonth = '';
+var summaryMonthSig = '';
+// 客户档案页筛选 / 批量选择（旧系统样式：搜索 + 类型 + 等级 + 批量删除）
+var customerTypeFilter = '';
+var customerGradeFilter = '';
+var selectedCustomerIds = {}; // id -> true，跨搜索/筛选保留
+var customerFilterSig = ''; // 类型/等级下拉选项的签名，数据不变时不重建选项
 var editingId = null; // 正在行内编辑的询盘 id
 var lastSyncSummaryText = ''; // 本次会话刚同步完的完整结果行；loadAll 刷新时保留它，不被“上次同步”盖掉
 
@@ -245,6 +269,192 @@ function buildTodos(customers, inquiries, today) {
   return todos.slice(0, MAX_TODOS_PER_RUN);
 }
 
+// ---------- 经营汇总（纯函数；口径见 import/Neoprene_经营汇总_2026_11月.xlsx 的“统计口径”表，全部现算，不写死数字） ----------
+// 确认订单：阶段含 订单确认 / 采购 / 已出货 / 已完成（substring；“订单确认·返单”算，“打样·返单”不算）。
+function isConfirmedOrder(o) {
+  var s = String((o && o.stage) || '');
+  for (var i = 0; i < CONFIRMED_STAGE_KEYS.length; i++) if (s.indexOf(CONFIRMED_STAGE_KEYS[i]) !== -1) return true;
+  return false;
+}
+// 已取消的订单不进销售额；当前 9 个阶段值里没有“取消”，留作口径（以后出现“取消”阶段自动排除）。
+function isCancelledOrder(o) { return String((o && o.stage) || '').indexOf('取消') !== -1; }
+function toNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  var n = parseFloat(v);
+  return isNaN(n) ? null : n;
+}
+function round2(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
+// 逐单折算：美元金额 × 本单汇率，四舍五入到分；金额或汇率缺失不算 0，返回 null（待补）。
+function orderCny(o) {
+  var amt = toNum(o.amount_usd), rate = toNum(o.exchange_rate);
+  if (amt === null || rate === null) return null;
+  return round2(amt * rate);
+}
+function fmtUSD(n) {
+  if (n === null || n === undefined) return '—';
+  return 'US$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtCNY(n) {
+  if (n === null || n === undefined) return '—';
+  return '¥' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtUsd0(n) { return n ? fmtUSD(n) : '—'; }
+function fmtCny0(n) { return n ? fmtCNY(n) : '—'; }
+// UTC 时间戳 -> 北京时间 YYYY-MM-DD（跟进历史的 recorded_at 是 UTC）。
+function beijingDate(iso) {
+  if (!iso) return '';
+  var t = new Date(iso);
+  if (isNaN(t.getTime())) return '';
+  return new Date(t.getTime() + 8 * 3600000).toISOString().slice(0, 10);
+}
+function monthKey(dateStr) { return String(dateStr || '').slice(0, 7); }
+// 询盘首次进入“已成交”的北京时间：跟进历史里 content 含“阶段：已成交”的最早一条；
+// 没有这样的历史时，回退到该询盘的创建时间（仅对当前阶段就是已成交的询盘，
+// 否则每条询盘都会在自己创建的月份“成交”）。返回 { inquiry_no: 'YYYY-MM-DD' }。
+function firstClosedDateByInquiry(history, inquiries) {
+  var map = {};
+  (history || []).forEach(function (h) {
+    if (!h || !h.inquiry_no) return;
+    if (String(h.content || '').indexOf('阶段：已成交') === -1) return;
+    var d = beijingDate(h.recorded_at);
+    if (!d) return;
+    if (!map[h.inquiry_no] || d < map[h.inquiry_no]) map[h.inquiry_no] = d;
+  });
+  (inquiries || []).forEach(function (inq) {
+    if (inq.stage !== '已成交') return;
+    if (map[inq.inquiry_no]) return;
+    var d = beijingDate(inq.source_created_at || inq.created_at);
+    if (d) map[inq.inquiry_no] = d;
+  });
+  return map;
+}
+// 成交客户去重键：订单按公司名精确匹配到客户档案用档案 id，匹配不上用公司名本身
+// （如 Abdullah：档案里公司为空、姓名是 Abdullah，按口径算自己的一个 key）；
+// 询盘用档案 id（无档案时用 profile_no / 询盘 id）。两边同一客户是同一个 key。
+function customerKeyForOrder(o, customersByCompany) {
+  var c = customersByCompany[String(o.customer_company || '').trim()];
+  if (c) return 'id:' + c.id;
+  return 'name:' + String(o.customer_company || '').trim();
+}
+function customerKeyForInquiry(inq) {
+  if (inq.customer_id) return 'id:' + inq.customer_id;
+  if (inq.profile_no) return 'profile:' + inq.profile_no;
+  return 'inq:' + inq.id;
+}
+// 一个月的经营汇总（全部现算）：
+//   销售额集合 = 本月已确认订单 + 本月其它未取消且 profit_status 已核对的订单，每单只计一次；
+//   已核对实际利润 = 本月 profit_status 已核对的订单（不限阶段）的 profit_rmb 之和；
+//   预计订单利润 = 本月已确认订单中金额/汇率/成本齐全的，Σ(逐单折算 − 成本)；
+//   成交客户 = 本月已确认订单的客户 ∪ 本月首次进入已成交的询盘客户，按客户去重；
+//   成交率 = 本期询盘中当前阶段已成交的条数 / 本期询盘数（不是成交客户数除以询盘数）。
+// 每日明细：询盘按询盘日期；成交客户按日去重；订单数为当日已确认订单；
+//   销售额/已核对利润/预计利润按订单日期归属当日。
+function computeMonthlySummary(orders, inquiries, history, customers, month) {
+  var byCompany = {};
+  (customers || []).forEach(function (c) {
+    var co = String(c.company || '').trim();
+    if (co && !byCompany[co]) byCompany[co] = c;
+  });
+  var closedByInq = firstClosedDateByInquiry(history, inquiries);
+  var inMonth = function (d) { return monthKey(d) === month; };
+  var onDay = function (d, ds) { return String(d || '').slice(0, 10) === ds; };
+
+  var monthInquiries = (inquiries || []).filter(function (q) { return inMonth(q.inquiry_date); });
+  var monthOrders = (orders || []).filter(function (o) { return inMonth(o.order_date); });
+  var confirmed = monthOrders.filter(isConfirmedOrder);
+
+  var salesSet = [], seenSales = {};
+  confirmed.forEach(function (o) { if (!seenSales[o.id]) { seenSales[o.id] = true; salesSet.push(o); } });
+  monthOrders.forEach(function (o) {
+    if (!isCancelledOrder(o) && o.profit_status === '已核对' && !seenSales[o.id]) {
+      seenSales[o.id] = true; salesSet.push(o);
+    }
+  });
+  var salesUsd = 0, salesCny = 0, missingSales = 0;
+  salesSet.forEach(function (o) {
+    var amt = toNum(o.amount_usd), cny = orderCny(o);
+    if (amt === null || cny === null) { missingSales++; return; }
+    salesUsd = round2(salesUsd + amt);
+    salesCny = round2(salesCny + cny);
+  });
+
+  var verified = monthOrders.filter(function (o) { return o.profit_status === '已核对'; });
+  var verifiedProfit = 0;
+  verified.forEach(function (o) { var p = toNum(o.profit_rmb); if (p !== null) verifiedProfit = round2(verifiedProfit + p); });
+
+  // 预计订单利润只算成本真正录入的已确认订单：profit_status 待确认的订单
+  // cost_rmb 是 0.00 占位（CSV 里 cost_note 都是“5项待确认”），不是真的 0 成本；
+  // 把占位 0 当成真成本会把整单销售额都算成利润（23 条已确认订单都是这种情况）。
+  var estOrders = confirmed.filter(function (o) {
+    return o.profit_status !== '待确认' &&
+      toNum(o.amount_usd) !== null && toNum(o.exchange_rate) !== null && toNum(o.cost_rmb) !== null;
+  });
+  var estProfit = 0;
+  estOrders.forEach(function (o) { estProfit = round2(estProfit + (orderCny(o) - toNum(o.cost_rmb))); });
+
+  var convertedKeys = {};
+  confirmed.forEach(function (o) { convertedKeys[customerKeyForOrder(o, byCompany)] = true; });
+  (inquiries || []).forEach(function (q) {
+    var d = closedByInq[q.inquiry_no];
+    if (d && inMonth(d)) convertedKeys[customerKeyForInquiry(q)] = true;
+  });
+
+  var convNow = monthInquiries.filter(function (q) { return q.stage === '已成交'; }).length;
+
+  var y = parseInt(month.slice(0, 4), 10), mo = parseInt(month.slice(5, 7), 10);
+  var daysInMonth = new Date(y, mo, 0).getDate();
+  var daily = [];
+  for (var day = 1; day <= daysInMonth; day++) {
+    var ds = month + '-' + String(day).padStart(2, '0');
+    var dInq = monthInquiries.filter(function (q) { return onDay(q.inquiry_date, ds); });
+    var dConf = confirmed.filter(function (o) { return onDay(o.order_date, ds); });
+    var dSalesSet = salesSet.filter(function (o) { return onDay(o.order_date, ds); });
+    var dUsd = 0, dCny = 0;
+    dSalesSet.forEach(function (o) {
+      var amt = toNum(o.amount_usd), cny = orderCny(o);
+      if (amt === null || cny === null) return;
+      dUsd = round2(dUsd + amt); dCny = round2(dCny + cny);
+    });
+    var dVerProfit = 0;
+    monthOrders.forEach(function (o) {
+      if (o.profit_status !== '已核对' || !onDay(o.order_date, ds)) return;
+      var p = toNum(o.profit_rmb);
+      if (p !== null) dVerProfit = round2(dVerProfit + p);
+    });
+    var dEst = 0;
+    dConf.forEach(function (o) {
+      // 同上：待确认的 0.00 成本是占位，不可算
+      if (o.profit_status === '待确认') return;
+      if (toNum(o.amount_usd) === null || toNum(o.exchange_rate) === null || toNum(o.cost_rmb) === null) return;
+      dEst = round2(dEst + (orderCny(o) - toNum(o.cost_rmb)));
+    });
+    var dKeys = {};
+    dConf.forEach(function (o) { dKeys[customerKeyForOrder(o, byCompany)] = true; });
+    (inquiries || []).forEach(function (q) {
+      if (closedByInq[q.inquiry_no] === ds) dKeys[customerKeyForInquiry(q)] = true;
+    });
+    daily.push({
+      date: ds, inquiries: dInq.length, converted: Object.keys(dKeys).length,
+      orders: dConf.length, salesUsd: dUsd, salesCny: dCny,
+      verifiedProfit: dVerProfit, estimatedProfit: dEst,
+      hasOrders: monthOrders.some(function (o) { return onDay(o.order_date, ds); })
+    });
+  }
+
+  return {
+    month: month,
+    inquiries: monthInquiries.length,
+    convertedCustomers: Object.keys(convertedKeys).length,
+    confirmedOrders: confirmed.length,
+    salesUsd: salesUsd, salesCny: salesCny, missingSales: missingSales,
+    verifiedProfit: verifiedProfit, verifiedA: verified.length, verifiedB: salesSet.length,
+    estimatedProfit: estProfit, estA: estOrders.length, estB: confirmed.length,
+    conversionRate: monthInquiries.length ? (100 * convNow / monthInquiries.length) : 0,
+    conversionNum: convNow, conversionDen: monthInquiries.length,
+    daily: daily
+  };
+}
+
 // ---------- Supabase REST（fetch 直调，10 秒超时；与工作面板同一做法） ----------
 function sb(table, opts) {
   opts = opts || {};
@@ -383,6 +593,8 @@ function renderCards() {
   $('customerCount').textContent = state.customers.length || '';
   $('reviewCount').textContent = cards.review || '';
   $('allCount').textContent = state.inquiries.length || '';
+  $('orderCount').textContent = state.orders.length || '';
+  $('supplierCount').textContent = state.suppliers.length || '';
   // 空态：未导入真实数据时显示导入提示条
   var empty = state.customers.length === 0 && state.inquiries.length === 0;
   $('importBanner').classList.toggle('hidden', !empty);
@@ -515,37 +727,417 @@ function renderTodos() {
   }).join('') + '</ol>';
 }
 
-function renderCustomers() {
-  var el = $('customerList');
+// ---------- 客户档案页（旧系统样式：宽松 6 列 + 头像 + 等级徽章） ----------
+// 旧站 6 列：公司/联系人 | 重要等级/建议 | 国家与类型 | 联系方式 | 最后联系 | 关联询盘。
+// 空字段只显示旧站的“待补充”占位，不编造内容。
+var AVATAR_COLORS = [
+  { bg: '#e8f5e9', fg: '#2e7d32' }, { bg: '#f3e8fd', fg: '#7e57c2' },
+  { bg: '#e3f2fd', fg: '#1565c0' }, { bg: '#fff3e0', fg: '#e65100' },
+  { bg: '#fce4ec', fg: '#c2185b' }, { bg: '#e0f2f1', fg: '#00695c' },
+  { bg: '#fff8e1', fg: '#f57f17' }, { bg: '#ede7f6', fg: '#512da8' }
+];
+function avatarColor(name) {
+  var h = 0;
+  for (var i = 0; i < String(name).length; i++) h = (h * 31 + String(name).charCodeAt(i)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+function gradePillClass(grade) {
+  var g = String(grade || '');
+  if (g.charAt(0) === 'A') return 'grade-a';
+  if (g.charAt(0) === 'B') return 'grade-b';
+  if (g.charAt(0) === 'C') return 'grade-c';
+  return 'grade-pending';
+}
+function whatsappUrl(w) {
+  var s = String(w || '').trim();
+  if (!s) return '';
+  if (/^https?:\/\//i.test(s)) return s;
+  var digits = s.replace(/\D/g, '');
+  return digits ? 'https://wa.me/' + digits : '';
+}
+// 每个客户的询盘数 + 进行中数（进行中 = 阶段不在 暂缓/已关闭/已成交）。
+function customerInquiryStats() {
+  var map = {};
+  state.inquiries.forEach(function (inq) {
+    var k = String(inq.customer_id || '');
+    if (!k) return;
+    var s = map[k] || (map[k] = { total: 0, active: 0 });
+    s.total++;
+    if (!isTerminalStage(inq.stage)) s.active++;
+  });
+  return map;
+}
+// 搜索 + 类型 + 等级三者叠加筛选（搜索只看公司、联系人、邮箱、国家）。
+function filteredCustomers() {
   var rows = state.customers.slice();
+  if (customerTypeFilter === '__missing__') {
+    rows = rows.filter(function (c) { return !String(c.customer_type || '').trim(); });
+  } else if (customerTypeFilter) {
+    rows = rows.filter(function (c) { return String(c.customer_type || '') === customerTypeFilter; });
+  }
+  if (customerGradeFilter) {
+    rows = rows.filter(function (c) { return String(c.grade || '') === customerGradeFilter; });
+  }
   if (customerSearchText) {
     var q = customerSearchText.toLowerCase();
     rows = rows.filter(function (c) {
-      return ((c.name || '') + ' ' + (c.company || '') + ' ' + (c.email || '') + ' ' + tagsToString(c.tags)).toLowerCase().indexOf(q) !== -1;
+      return ((c.company || '') + ' ' + (c.name || '') + ' ' + (c.email || '') + ' ' + (c.country || '')).toLowerCase().indexOf(q) !== -1;
     });
+  }
+  return rows;
+}
+// 类型/等级下拉选项由数据里实际出现的值生成；数据不变时不重建（不丢当前选择）。
+function syncCustomerFilterOptions() {
+  var typeSel = $('filterCustomerType'), gradeSel = $('filterCustomerGrade');
+  if (!typeSel || !gradeSel) return;
+  var types = [], seenT = {};
+  state.customers.forEach(function (c) {
+    var t = String(c.customer_type || '').trim();
+    if (t && !seenT[t]) { seenT[t] = true; types.push(t); }
+  });
+  types.sort(function (a, b) { return a.localeCompare(b, 'zh-CN'); });
+  var gradeOrder = ['A · 重点跟进', 'B · 正常推进', 'C · 暂缓 / 低优先', '待评估'];
+  var grades = [], seenG = {};
+  state.customers.forEach(function (c) {
+    var g = String(c.grade || '');
+    if (g && !seenG[g]) { seenG[g] = true; grades.push(g); }
+  });
+  grades.sort(function (a, b) {
+    var ia = gradeOrder.indexOf(a), ib = gradeOrder.indexOf(b);
+    if (ia === -1) ia = 99; if (ib === -1) ib = 99;
+    return (ia - ib) || a.localeCompare(b, 'zh-CN');
+  });
+  var sig = types.join('|') + '#' + grades.join('|');
+  if (sig === customerFilterSig) return;
+  customerFilterSig = sig;
+  var curT = typeSel.value, curG = gradeSel.value;
+  typeSel.innerHTML = '<option value="">全部客户类型</option>' +
+    types.map(function (t) { return '<option value="' + esc(t) + '">' + esc(t) + '</option>'; }).join('') +
+    '<option value="__missing__">类型待补充</option>';
+  gradeSel.innerHTML = '<option value="">全部重要等级</option>' +
+    grades.map(function (g) { return '<option value="' + esc(g) + '">' + esc(g) + '</option>'; }).join('');
+  if (curT && (curT === '__missing__' || seenT[curT])) typeSel.value = curT;
+  if (curG && seenG[curG]) gradeSel.value = curG;
+}
+
+function customerRowHtml(c, st) {
+  var t = todayStr();
+  var displayName = c.company || c.name || '未知客户';
+  var letter = String(displayName).charAt(0) || '?';
+  var av = avatarColor(displayName);
+  // 公司为空时不重复显示联系人姓名
+  var contactLine = (c.company && c.name) ? esc(c.name) : '';
+  if (c.job_title) contactLine += (contactLine ? ' · ' : '') + esc(c.job_title);
+  var last = c.last_contact_at ? String(c.last_contact_at).slice(0, 10) : '';
+  var gap = last ? daysBetween(last, t) : null;
+  var wa = whatsappUrl(c.whatsapp);
+  var checked = selectedCustomerIds[String(c.id)] ? ' checked' : '';
+  return '<tr>' +
+    '<td class="check-col"><input type="checkbox" data-select-customer="' + esc(c.id) + '"' + checked + '></td>' +
+    '<td><div class="cust-id"><span class="cust-avatar" style="background:' + av.bg + ';color:' + av.fg + '">' + esc(letter) + '</span><div class="cust-id-text">' +
+    '<div class="cust-company">' + esc(displayName) + '</div>' +
+    (contactLine ? '<div class="cust-sub">' + contactLine + '</div>' : '') +
+    (c.cn_background_status === '已完成' ? '<div class="cust-bg">中文背调已完成</div>' : '') +
+    (c.website ? '<div class="cust-sub">' + esc(c.website) + '</div>' : '') +
+    '</div></div></td>' +
+    '<td><span class="grade-pill ' + gradePillClass(c.grade) + '">' + esc(c.grade || '待评估') + '</span>' +
+    (c.eval_advice ? '<div class="cust-advice">' + esc(c.eval_advice) + '</div>' : '') + '</td>' +
+    '<td>' + (c.country ? '<div>' + esc(c.country) + '</div>' : '<div class="cust-sub">地区待补充</div>') +
+    (c.customer_type ? '<span class="type-pill">' + esc(c.customer_type) + '</span>' : '<span class="type-pill type-missing">类型待补充</span>') + '</td>' +
+    '<td>' + (c.email ? '<div>' + esc(c.email) + '</div>' : '<div class="cust-sub">—</div>') +
+    (c.phone ? '<div class="cust-sub">手机 ' + esc(c.phone) + '</div>' : '') +
+    (wa ? '<a class="wa-btn" href="' + esc(wa) + '" target="_blank" rel="noopener">打开 WhatsApp ↗</a>' : '') + '</td>' +
+    '<td>' + (gap === null ? '—' : '<div>' + gap + ' 天未联系</div><div class="cust-sub">' + esc(last) + '</div>') + '</td>' +
+    '<td><div><b class="inq-num">' + st.total + '</b> 条询盘</div><div class="cust-sub">' + st.active + ' 条进行中</div></td>' +
+    '<td class="chev">›</td></tr>';
+}
+
+function renderCustomers() {
+  var el = $('customerList');
+  syncCustomerFilterOptions();
+  var pill = $('customerCountPill');
+  if (pill) pill.textContent = state.customers.length;
+  var rows = filteredCustomers();
+  var stats = customerInquiryStats();
+  var selectedCount = Object.keys(selectedCustomerIds).filter(function (id) { return selectedCustomerIds[id]; }).length;
+  var batchBtn = $('batchDeleteBtn');
+  if (batchBtn) {
+    batchBtn.disabled = selectedCount === 0;
+    batchBtn.textContent = selectedCount > 0 ? '🗑 批量删除（' + selectedCount + '）' : '🗑 批量删除';
   }
   if (!rows.length) {
     el.innerHTML = '<div class="empty">暂无客户档案。' +
-      (state.customers.length === 0 ? '请先按 README 第 5 步导入旧站导出文件（216 位客户）。' : '先在上面添加一位吧。') + '</div>';
+      (state.customers.length === 0 ? '请先按 README 第 5 步导入旧站导出文件（216 位客户）。' : '试试换个搜索词或筛选条件。') + '</div>';
     return;
   }
-  el.innerHTML = '<table class="cust-table"><thead><tr><th>客户</th><th>公司 / 邮箱</th><th>国家 / 电话</th><th>等级</th><th>验证</th><th>标签</th><th>发出 / 已读</th><th>最后联系</th><th>下次跟进</th><th>下一步动作</th></tr></thead><tbody>' +
-    rows.map(function (c) {
-      var vs = c.verification_status || 'unverified';
-      var tags = normalizeTags(c.tags);
-      return '<tr><td><b>' + esc(c.name || '') + '</b></td>' +
-        '<td>' + esc(c.company || '') + '<div class="c-sub">' + esc(c.email || '') + '</div></td>' +
-        '<td>' + esc(c.country || '') + (c.phone ? '<div class="c-sub">' + esc(c.phone) + '</div>' : '') + '</td>' +
-        '<td>' + esc(c.grade || '—') + '</td>' +
-        // v3：邮箱验证状态徽章（只有 valid / unknown 以后可群发；群发在来发信里做）
-        '<td><span class="badge v-' + esc(vs) + '">' + esc(verificationLabel(vs)) + '</span></td>' +
-        '<td>' + (tags.length ? tags.map(function (t) { return '<span class="tag-chip">' + esc(t) + '</span>'; }).join(' ') : '<span class="c-sub">—</span>') + '</td>' +
-        // v3：开发 / 阅读计数（发出一封 +1，收到一封匹配到的回复 +1）
-        '<td>' + (parseInt(c.outreach_count, 10) || 0) + ' / ' + (parseInt(c.read_count, 10) || 0) + '</td>' +
-        '<td>' + esc(fmtDate(c.last_contact_at)) + '</td>' +
-        '<td>' + esc(fmtDate(c.next_followup_at)) + '</td>' +
-        '<td>' + esc(c.next_action || c.eval_next_action || '—') + '</td></tr>';
-    }).join('') + '</tbody></table>';
+  var allSelected = rows.length > 0 && rows.every(function (c) { return selectedCustomerIds[String(c.id)]; });
+  var html = '<table class="cust-table"><thead><tr>' +
+    '<th class="check-col"><input type="checkbox" data-select-all-customers' + (allSelected ? ' checked' : '') + ' title="全选当前筛选结果"></th>' +
+    '<th>公司 / 联系人</th><th>重要等级 / 建议</th><th>国家与类型</th><th>联系方式</th><th>最后联系</th><th>关联询盘</th><th></th>' +
+    '</tr></thead><tbody>';
+  rows.forEach(function (c) { html += customerRowHtml(c, stats[String(c.id)] || { total: 0, active: 0 }); });
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+// 客户档案页的状态行（导入/导出/删除的反馈，写在表格上方，不动顶部的全局状态行）。
+function setCustomerStatus(msg, isError) {
+  var el = $('customerStatus');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle('error', !!isError);
+}
+
+// ---------- 客户档案：批量删除 ----------
+// 外键实情（supabase-followup.sql）：删客户会级联删掉该客户的询盘、跟进历史、
+// 背调/来源/社媒、待办；已同步的邮件是 on delete set null——邮件保留，只取消关联。
+// 确认框与提示文案都按这个实情写，不写“邮件一起删除”。
+function batchDeleteCustomers() {
+  var ids = Object.keys(selectedCustomerIds).filter(function (id) { return selectedCustomerIds[id]; });
+  if (!ids.length) return;
+  var inqCount = state.inquiries.filter(function (inq) { return selectedCustomerIds[String(inq.customer_id)]; }).length;
+  var ok = confirm('确定删除选中的 ' + ids.length + ' 位客户吗？\n\n将同时删除：\n· 该客户的 ' + inqCount + ' 条询盘\n· 相关的跟进记录和待办\n\n已同步的邮件会保留，但不再关联这些客户。\n\n删除后无法恢复，请谨慎操作。');
+  if (!ok) return;
+  if (!hasKey) { alert('未配置 Supabase key，无法删除'); return; }
+  setCustomerStatus('正在删除 ' + ids.length + ' 位客户……');
+  var done = 0, failed = 0;
+  var chain = Promise.resolve();
+  ids.forEach(function (id) {
+    chain = chain.then(function () {
+      return sbDelete('followup_customers', id).then(function () { done++; }).catch(function () { failed++; });
+    });
+  });
+  chain.then(function () {
+    selectedCustomerIds = {};
+    loadAll();
+    setCustomerStatus('已删除 ' + done + ' 位客户' + (failed ? '，失败 ' + failed + ' 位（请刷新后重试）' : '') + '。');
+  });
+}
+
+// ---------- 客户档案：导入 / 导出 Excel ----------
+// SheetJS 只在第一次点导入/导出时才从 CDN 懒加载；页面本身不挂任何外部 JS，
+// CDN 挂了也不影响页面打开。导入 .csv 不需要 SheetJS，始终可用。
+var sheetJsPromise = null;
+function loadSheetJS() {
+  if (typeof window !== 'undefined' && window.XLSX) return Promise.resolve(window.XLSX);
+  if (sheetJsPromise) return sheetJsPromise;
+  sheetJsPromise = new Promise(function (resolve, reject) {
+    var s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    var done = false;
+    var timer = setTimeout(function () { if (!done) { done = true; reject(new Error('加载超时（20 秒）')); } }, 20000);
+    s.onload = function () {
+      if (done) return; done = true; clearTimeout(timer);
+      if (window.XLSX) resolve(window.XLSX);
+      else reject(new Error('加载后未找到 XLSX'));
+    };
+    s.onerror = function () { if (done) return; done = true; clearTimeout(timer); reject(new Error('CDN 加载失败')); };
+    document.head.appendChild(s);
+  }).catch(function (e) { sheetJsPromise = null; throw e; });
+}
+// 原生 CSV 解析（处理引号、逗号、换行与 "" 转义），第一行为表头。
+function parseCsvText(text) {
+  var rows = [];
+  var cur = [], field = '', inQ = false;
+  var t = String(text || '').replace(/^\uFEFF/, '');
+  for (var i = 0; i < t.length; i++) {
+    var ch = t[i];
+    if (inQ) {
+      if (ch === '"') {
+        if (t[i + 1] === '"') { field += '"'; i++; }
+        else inQ = false;
+      } else field += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === ',') { cur.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && t[i + 1] === '\n') i++;
+      cur.push(field); field = '';
+      rows.push(cur); cur = [];
+    } else field += ch;
+  }
+  if (field !== '' || cur.length) { cur.push(field); rows.push(cur); }
+  while (rows.length && rows[rows.length - 1].every(function (v) { return String(v).trim() === ''; })) rows.pop();
+  if (!rows.length) return [];
+  var headers = rows[0].map(function (h) { return String(h || '').trim(); });
+  return rows.slice(1).map(function (r) {
+    var o = {};
+    headers.forEach(function (h, idx) { o[h] = r[idx] != null ? String(r[idx]).trim() : ''; });
+    return o;
+  });
+}
+// 导入表头映射：中文为主，英文为 fallback（键一律小写后查）。
+var IMPORT_FIELD_MAP = {
+  '公司': 'company', 'company': 'company',
+  '联系人': 'name', '联系人姓名': 'name', 'contact': 'name',
+  '邮箱': 'email', 'email': 'email',
+  '国家': 'country', '国家 / 地区': 'country', 'country': 'country',
+  '电话': 'phone', '手机号码': 'phone', 'phone': 'phone',
+  'whatsapp': 'whatsapp',
+  '客户类型': 'customer_type', 'type': 'customer_type',
+  '官网': 'website', 'website': 'website',
+  '职位': 'job_title', '客户职位': 'job_title', 'title': 'job_title'
+};
+function normalizeImportRows(rawRows) {
+  return (rawRows || []).map(function (r) {
+    var o = {};
+    Object.keys(r || {}).forEach(function (k) {
+      var f = IMPORT_FIELD_MAP[String(k).trim().toLowerCase()];
+      if (f && r[k] != null) o[f] = String(r[k]).trim();
+    });
+    return o;
+  });
+}
+function importCustomersFromRows(rawRows) {
+  var rows = normalizeImportRows(rawRows);
+  var existing = {};
+  state.customers.forEach(function (c) { var e = normalizeEmail(c.email); if (e) existing[e] = true; });
+  var seenInFile = {};
+  var toInsert = [], skippedDup = 0, skippedNoEmail = 0;
+  rows.forEach(function (r) {
+    var em = normalizeEmail(r.email);
+    if (!em) { skippedNoEmail++; return; }
+    if (existing[em] || seenInFile[em]) { skippedDup++; return; }
+    seenInFile[em] = true;
+    toInsert.push({
+      name: r.name || '', company: r.company || '', email: em,
+      country: r.country || '', phone: r.phone || '', whatsapp: r.whatsapp || '',
+      customer_type: r.customer_type || '', website: r.website || '', job_title: r.job_title || '',
+      grade: '待评估', stage: '待评估', source: '导入',
+      verification_status: 'unverified', tags: [], outreach_count: 0, read_count: 0,
+      health_score: 50, last_contact_at: null, next_followup_at: null, next_action: ''
+    });
+  });
+  if (!toInsert.length) {
+    setCustomerStatus('导入完成：新增 0 位，跳过（已存在）' + skippedDup + ' 位，跳过（无邮箱）' + skippedNoEmail + ' 位。');
+    return;
+  }
+  if (!hasKey) { alert('未配置 Supabase key，无法导入'); return; }
+  setCustomerStatus('正在导入 ' + toInsert.length + ' 位新客户……');
+  // 先整批插一次（快）；整批失败再逐条插，逐条失败的计入失败数。
+  var failed = 0;
+  sb('followup_customers', { method: 'POST', body: toInsert }).then(function (inserted) {
+    var n = Array.isArray(inserted) ? inserted.length : toInsert.length;
+    finishImport(n, skippedDup, skippedNoEmail, failed);
+  }).catch(function () {
+    var chain = Promise.resolve();
+    var okCount = 0;
+    toInsert.forEach(function (row) {
+      chain = chain.then(function () {
+        return sbInsert('followup_customers', row).then(function () { okCount++; }).catch(function () { failed++; });
+      });
+    });
+    chain.then(function () { finishImport(okCount, skippedDup, skippedNoEmail, failed); });
+  });
+}
+function finishImport(added, skippedDup, skippedNoEmail, failed) {
+  var msg = '导入完成：新增 ' + added + ' 位，跳过（已存在）' + skippedDup + ' 位，跳过（无邮箱）' + skippedNoEmail + ' 位' +
+    (failed ? '，失败 ' + failed + ' 位（请检查后重试）' : '') + '。';
+  setCustomerStatus(msg);
+  loadAll();
+}
+function handleImportFile(file) {
+  if (!file) return;
+  var name = String(file.name || '').toLowerCase();
+  if (name.endsWith('.csv')) {
+    setCustomerStatus('正在读取 ' + file.name + '……');
+    file.text().then(function (txt) {
+      importCustomersFromRows(parseCsvText(txt));
+    }).catch(function (e) { setCustomerStatus('读取文件失败：' + e.message, true); });
+  } else if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+    setCustomerStatus('正在加载表格解析组件并读取 ' + file.name + '……');
+    loadSheetJS().then(function (XLSX) {
+      return file.arrayBuffer().then(function (buf) {
+        var wb = XLSX.read(buf, { type: 'array' });
+        var ws = wb.Sheets[wb.SheetNames[0]];
+        importCustomersFromRows(XLSX.utils.sheet_to_json(ws, { defval: '' }));
+      });
+    }).catch(function (e) {
+      setCustomerStatus('导入失败：表格组件未能从 CDN 加载（' + e.message + '），.xlsx 暂不可导入；可以先把文件另存为 .csv 再导入。', true);
+    });
+  } else {
+    setCustomerStatus('只支持 .xlsx / .csv 文件。', true);
+  }
+  $('importCustomersFile').value = ''; // 允许下次再选同一个文件
+}
+// 导出全部客户（忽略当前搜索/筛选）的成对行：每条询盘一行 + 无询盘的客户补一行。
+function allCustomerExportPairs() {
+  var byId = {};
+  state.customers.forEach(function (c) { byId[c.id] = c; });
+  var out = state.inquiries.map(function (inq) { return { customer: byId[inq.customer_id] || {}, inquiry: inq }; });
+  var withInquiry = {};
+  state.inquiries.forEach(function (inq) { withInquiry[inq.customer_id] = true; });
+  state.customers.forEach(function (c) { if (!withInquiry[c.id]) out.push({ customer: c, inquiry: null }); });
+  return out;
+}
+// 导出全部客户 Excel：3 个工作表（客户档案 / 关联询盘 / 邮件沟通），一律是全部数据，
+// 不受下方搜索与筛选影响。CDN 失败时退回下载同名字段的 CSV，并明说。
+function exportCustomersExcel() {
+  setCustomerStatus('正在准备导出全部客户……');
+  loadSheetJS().then(function (XLSX) {
+    var byId = {};
+    state.customers.forEach(function (c) { byId[c.id] = c; });
+    var inqNoById = {};
+    state.inquiries.forEach(function (inq) { inqNoById[inq.id] = inq.inquiry_no || ''; });
+    var custRows = state.customers.map(function (c) {
+      return {
+        '客户档案编号': c.profile_no || '', '公司': c.company || '', '联系人': c.name || '',
+        '国家': c.country || '', '职位': c.job_title || '', '邮箱': c.email || '',
+        '官网': c.website || '', '电话': c.phone || '', 'WhatsApp': c.whatsapp || '',
+        '其他联系方式': c.other_contact || '', '客户类型': c.customer_type || '',
+        '客户来源': c.source || '', '等级': c.grade || '', '等级设置': c.grade_source || '',
+        '跟进建议': c.eval_advice || '', '建议下一步': c.eval_next_action || '',
+        '邮箱验证状态': verificationLabel(c.verification_status || 'unverified'),
+        '标签': tagsToString(c.tags), '发出计数': c.outreach_count || 0, '已读计数': c.read_count || 0,
+        '健康度': c.health_score, '最后联系': fmtDate(c.last_contact_at) === '—' ? '' : fmtDate(c.last_contact_at),
+        '下次跟进': fmtDate(c.next_followup_at) === '—' ? '' : fmtDate(c.next_followup_at),
+        '下一步动作': c.next_action || '', '中文背调状态': c.cn_background_status || '',
+        '客户背景': c.background || '', '客户备注': c.notes || '',
+        '创建时间': c.source_created_at || '', '更新时间': c.source_updated_at || ''
+      };
+    });
+    var inqRows = state.inquiries.map(function (inq) {
+      var c = byId[inq.customer_id] || {};
+      return {
+        '询盘编号': inq.inquiry_no || '', '客户档案编号': inq.profile_no || '',
+        '公司': c.company || '', '联系人': c.name || '',
+        '产品类别': inq.product_category || '', '产品需求': inq.product || '',
+        '规格': inq.specs || '', '数量': inq.quantity || '', '当前阶段': inq.stage || '',
+        '客户回复状态': inq.reply_status || '', '最近回复': inq.reply_snippet || '',
+        '询盘日期': inq.inquiry_date || '',
+        '最近联系日期': fmtDate(inq.last_contact_at) === '—' ? '' : fmtDate(inq.last_contact_at),
+        '下次跟进日期': fmtDate(inq.next_followup_at) === '—' ? '' : fmtDate(inq.next_followup_at),
+        '日期已手动确认': inq.next_followup_confirmed ? '是' : '否',
+        '下一步动作': inq.next_action || '', '询盘备注': inq.notes || ''
+      };
+    });
+    var mailRows = state.emails.map(function (e) {
+      var c = byId[e.customer_id] || {};
+      return {
+        '客户': c.company || c.name || '', '询盘编号': inqNoById[e.inquiry_id] || '',
+        '主题': e.subject || '', '发件人': e.from_email || '', '收件人': e.to_email || '',
+        '方向': e.direction === 'out' ? '发出' : '收到',
+        '发送时间': e.sent_at || '', '意向': INTENT_LABELS[e.intent] || e.intent || '',
+        '待判断': e.needs_review ? '是' : '否', '摘要': e.snippet || ''
+      };
+    });
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(custRows), '客户档案');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(inqRows), '关联询盘');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(mailRows), '邮件沟通');
+    XLSX.writeFile(wb, '客户档案-' + todayStr() + '.xlsx');
+    setCustomerStatus('已导出全部 ' + state.customers.length + ' 位客户（客户档案 / 关联询盘 / 邮件沟通 3 个工作表，不受筛选影响）。');
+  }).catch(function () {
+    var csv = buildExportCsv(allCustomerExportPairs());
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '客户档案-' + todayStr() + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+    setCustomerStatus('表格组件未能从 CDN 加载，已改为导出 CSV（全部 ' + state.customers.length + ' 位客户，字段相同），请检查下载。', true);
+  });
 }
 
 function renderReview() {
@@ -590,6 +1182,268 @@ function renderReview() {
   el.innerHTML = html;
 }
 
+// ---------- 项目与订单（旧系统样式：宽松 6 列表格） ----------
+// 订单类型 = 阶段在“·”之前的部分（“订单确认·返单”属“订单确认”，“采购/生产·已发货”属“采购/生产”）。
+function orderTypeOf(stage) { return String(stage || '').split('·')[0]; }
+// 每个公司的累计已确认订单数（与经营汇总同一口径，从已加载的全部订单里算，不受筛选影响）。
+function confirmedCountByCompany() {
+  var map = {};
+  state.orders.forEach(function (o) {
+    var co = String(o.customer_company || '').trim();
+    if (!co) return;
+    if (!map[co]) map[co] = 0;
+    if (isConfirmedOrder(o)) map[co]++;
+  });
+  return map;
+}
+function filteredOrders() {
+  var rows = state.orders.slice();
+  if (orderTypeFilter) rows = rows.filter(function (o) { return orderTypeOf(o.stage) === orderTypeFilter; });
+  if (orderCustomerFilter) rows = rows.filter(function (o) { return String(o.customer_company || '') === orderCustomerFilter; });
+  if (orderStageFilter) rows = rows.filter(function (o) { return String(o.stage || '') === orderStageFilter; });
+  if (orderSearchText) {
+    var q = orderSearchText.toLowerCase();
+    rows = rows.filter(function (o) {
+      return ((o.customer_company || '') + ' ' + (o.customer_contact || '') + ' ' + (o.title || '') + ' ' + (o.order_no || '')).toLowerCase().indexOf(q) !== -1;
+    });
+  }
+  rows.sort(function (a, b) {
+    var da = a.order_date || '', db = b.order_date || '';
+    if (da !== db) return da < db ? 1 : -1; // 日期倒序（无日期的沉底）
+    return String(a.order_no || '') < String(b.order_no || '') ? -1 : 1;
+  });
+  return rows;
+}
+// 类型 / 客户 / 阶段下拉由数据里实际出现的值生成；数据不变时不重建（不丢当前选择）。
+// 新建表单的阶段下拉也用同一份阶段值；无数据时用已知的 9 个阶段兜底。
+function syncOrderFilterOptions() {
+  var types = [], seenT = {};
+  var companies = [], seenC = {};
+  var stages = [], seenS = {};
+  state.orders.forEach(function (o) {
+    var t = orderTypeOf(o.stage);
+    if (t && !seenT[t]) { seenT[t] = true; types.push(t); }
+    var co = String(o.customer_company || '').trim();
+    if (co && !seenC[co]) { seenC[co] = true; companies.push(co); }
+    var s = String(o.stage || '');
+    if (s && !seenS[s]) { seenS[s] = true; stages.push(s); }
+  });
+  companies.sort(function (a, b) { return a.localeCompare(b, 'zh-CN'); });
+  var sig = types.join('|') + '#' + companies.join('|') + '#' + stages.join('|');
+  if (sig === orderFilterSig) return;
+  orderFilterSig = sig;
+  var typeSel = $('filterOrderType'), custSel = $('filterOrderCustomer'), stageSel = $('filterOrderStage');
+  if (!typeSel || !custSel || !stageSel) return;
+  var curT = typeSel.value, curC = custSel.value, curS = stageSel.value;
+  typeSel.innerHTML = '<option value="">全部订单类型</option>' +
+    types.map(function (t) { return '<option value="' + esc(t) + '">' + esc(t) + '</option>'; }).join('');
+  custSel.innerHTML = '<option value="">全部客户</option>' +
+    companies.map(function (c) { return '<option value="' + esc(c) + '">' + esc(c) + '</option>'; }).join('');
+  stageSel.innerHTML = '<option value="">全部阶段</option>' +
+    stages.map(function (s) { return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join('');
+  if (curT && seenT[curT]) typeSel.value = curT;
+  if (curC && seenC[curC]) custSel.value = curC;
+  if (curS && seenS[curS]) stageSel.value = curS;
+  var formStage = document.querySelector('#orderForm [data-f="stage"]');
+  if (formStage) {
+    var opts = stages.length ? stages : ORDER_STAGES;
+    var curF = formStage.value;
+    formStage.innerHTML = opts.map(function (s) { return '<option value="' + esc(s) + '">' + esc(s) + '</option>'; }).join('');
+    if (curF && opts.indexOf(curF) !== -1) formStage.value = curF;
+  }
+}
+// 利润栏三行：待确认绝不显示成 0 或数字。
+//   第 1 行：已核对 ? “已核对” : “待确认”
+//   第 2 行：已核对 ? “实际利润率 X%” : “实际利润率 —”
+//   第 3 行：预计 ? “预计 ¥P · X%” : 已核对 ? “实际 ¥P · X%” : “预计 待确认 · —”
+function orderProfitCell(o) {
+  var verified = o.profit_status === '已核对';
+  var estimated = o.profit_status === '预计';
+  var rate = toNum(o.profit_rate);
+  var profit = toNum(o.profit_rmb);
+  var line1 = verified ? '已核对' : '待确认';
+  var line2 = verified ? '实际利润率 ' + (rate !== null ? rate + '%' : '—') : '实际利润率 —';
+  var line3;
+  if (estimated) {
+    line3 = '预计 ' + (profit !== null ? fmtCNY(profit) : '—') + ' · ' + (rate !== null ? rate + '%' : '—');
+  } else if (verified) {
+    line3 = '实际 ' + (profit !== null ? fmtCNY(profit) : '—') + ' · ' + (rate !== null ? rate + '%' : '—');
+  } else {
+    line3 = '预计 待确认 · —';
+  }
+  return '<div class="o-profit-state">' + esc(line1) + '</div>' +
+    '<div class="c-sub">' + esc(line2) + '</div>' +
+    '<div class="c-sub">' + esc(line3) + '</div>';
+}
+
+function orderRowHtml(o, confirmedMap) {
+  var co = String(o.customer_company || '').trim();
+  var confirmedN = confirmedMap[co] || 0;
+  var amt = toNum(o.amount_usd), rec = toNum(o.received_usd);
+  var rate = toNum(o.exchange_rate), cost = toNum(o.cost_rmb);
+  return '<tr>' +
+    '<td><div class="c-sub">' + esc(o.order_no || '') + '</div>' +
+    '<div class="c-name">' + esc(o.title || '') + '</div>' +
+    '<div class="c-sub">' + esc(fmtDate(o.order_date)) + (o.stage ? ' · ' + esc(o.stage) : '') + '</div></td>' +
+    '<td>' + (co ? '<button class="link-btn" data-filter-order-customer="' + esc(co) + '" title="点击只看该客户的项目与订单">' + esc(co) + '</button>' : '<span class="c-sub">—</span>') +
+    (o.customer_contact ? ' · ' + esc(o.customer_contact) : '') +
+    '<div class="c-sub">累计 ' + confirmedN + ' 笔已确认订单</div></td>' +
+    '<td><div class="c-name">' + esc(amt !== null ? fmtUSD(amt) : '—') + '</div>' +
+    '<div class="c-sub">' + (rec !== null ? '已收 ' + fmtUSD(rec) : '已收 —') + '</div></td>' +
+    '<td><div>' + (rate !== null ? esc(String(rate)) : '—') + '</div><div class="c-sub">每单独立设置</div></td>' +
+    '<td><div class="c-name">' + esc(cost !== null ? fmtCNY(cost) : '—') + '</div>' +
+    (o.cost_note ? '<div class="c-sub">' + esc(o.cost_note) + '</div>' : '') + '</td>' +
+    '<td>' + orderProfitCell(o) + '</td></tr>';
+}
+
+function renderOrders() {
+  var el = $('orderList');
+  syncOrderFilterOptions();
+  var pill = $('orderCountPill');
+  if (pill) pill.textContent = state.orders.length;
+  var rows = filteredOrders();
+  var confirmedMap = confirmedCountByCompany();
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty">暂无项目与订单。' +
+      (state.orders.length === 0 ? '请先在 Supabase 执行 supabase-followup.sql 建表，再按 README 用 import/import-orders-suppliers.py 导入。' : '试试换个搜索词或筛选条件。') + '</div>';
+    return;
+  }
+  var html = '<table class="follow-table order-table"><thead><tr><th>项目 / 订单</th><th>客户 / 公司</th><th>销售总额 USD</th><th>本单汇率</th><th>已录实际成本 RMB</th><th>订单利润 RMB / 利润率</th></tr></thead><tbody>';
+  rows.forEach(function (o) { html += orderRowHtml(o, confirmedMap); });
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+// ---------- 供应商与物流（旧系统样式：宽松 4 列表格） ----------
+// 空字段在库里的原文就是“待补充”/“联系方式待补充”/“联系人待补充”，原样显示；
+// 新建时留空的字段也显示同一占位，不编造内容。
+function filteredSuppliers() {
+  var rows = state.suppliers.slice();
+  if (supplierKindFilter) rows = rows.filter(function (s) { return String(s.kind || '') === supplierKindFilter; });
+  if (supplierSearchText) {
+    var q = supplierSearchText.toLowerCase();
+    rows = rows.filter(function (s) {
+      return ((s.name || '') + ' ' + (s.contact || '') + ' ' + (s.service_or_route || '')).toLowerCase().indexOf(q) !== -1;
+    });
+  }
+  rows.sort(function (a, b) { return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN'); });
+  return rows;
+}
+
+function renderSuppliers() {
+  var el = $('supplierList');
+  var pill = $('supplierCountPill');
+  if (pill) pill.textContent = state.suppliers.length;
+  var rows = filteredSuppliers();
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty">暂无供应商与物流。' +
+      (state.suppliers.length === 0 ? '请先在 Supabase 执行 supabase-followup.sql 建表，再按 README 用 import/import-orders-suppliers.py 导入。' : '试试换个搜索词或筛选条件。') + '</div>';
+    return;
+  }
+  var html = '<table class="follow-table supplier-table"><thead><tr><th>伙伴 / 类型</th><th>联系人与联系方式</th><th>材料、服务或物流线路</th><th>关联费用</th><th></th></tr></thead><tbody>';
+  rows.forEach(function (s) {
+    html += '<tr><td><div class="c-name">' + esc(s.name || '') + '</div>' +
+      '<div class="c-sub">' + esc(s.kind || '') + '</div></td>' +
+      '<td><div>' + esc(s.contact || '联系人待补充') + '</div>' +
+      '<div class="c-sub">' + esc(s.contact_info || '联系方式待补充') + '</div></td>' +
+      '<td>' + esc(s.service_or_route || '待补充') + '</td>' +
+      '<td><div class="c-name">' + (parseInt(s.detail_count, 10) || 0) + ' 条明细</div></td>' +
+      '<td class="chev">›</td></tr>';
+  });
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+// ---------- 经营汇总与报表 ----------
+// 月份下拉由询盘日期 + 订单日期里实际出现的月份生成；默认取最晚的有活动月份。
+function availableMonths() {
+  var set = {};
+  state.inquiries.forEach(function (q) { var m = monthKey(q.inquiry_date); if (m) set[m] = true; });
+  state.orders.forEach(function (o) { var m = monthKey(o.order_date); if (m) set[m] = true; });
+  return Object.keys(set).sort();
+}
+function syncSummaryMonthOptions() {
+  var sel = $('summaryMonth');
+  if (!sel) return;
+  var months = availableMonths();
+  var sig = months.join('|');
+  if (sig === summaryMonthSig) return;
+  summaryMonthSig = sig;
+  if (!months.length) {
+    sel.innerHTML = '<option value="">暂无数据</option>';
+    summaryMonth = '';
+    return;
+  }
+  if (!summaryMonth || months.indexOf(summaryMonth) === -1) summaryMonth = months[months.length - 1];
+  sel.innerHTML = months.map(function (m) {
+    return '<option value="' + esc(m) + '"' + (m === summaryMonth ? ' selected' : '') + '>' + esc(m) + '</option>';
+  }).join('');
+}
+// 每日实际利润柱状图（纯 CSS div，不用图表库）：每天一根柱子，柱高按当日已核对利润，
+// 数值写在日期下方；有订单但尚不可算的日子画一条灰色虚线（旧站图例同款）。
+function renderSummaryChart(s) {
+  var el = $('summaryChart');
+  var max = 0;
+  s.daily.forEach(function (d) { if (d.verifiedProfit > max) max = d.verifiedProfit; });
+  el.innerHTML = s.daily.map(function (d) {
+    var dayNum = parseInt(d.date.slice(8, 10), 10);
+    var bar = '';
+    if (d.verifiedProfit > 0) {
+      var h = Math.max(3, Math.round(d.verifiedProfit / max * 110));
+      bar = '<div class="bar" style="height:' + h + 'px" title="' + esc(d.date) + ' 已核对利润 ' + fmtCNY(d.verifiedProfit) + '"></div>';
+    } else if (d.hasOrders) {
+      bar = '<div class="bar-dash" title="' + esc(d.date) + ' 有订单但尚不可算"></div>';
+    }
+    var val = d.verifiedProfit > 0 ? fmtCNY(d.verifiedProfit) : '—';
+    return '<div class="bar-col">' + bar + '<div class="bar-day">' + dayNum + '日</div><div class="bar-val">' + esc(val) + '</div></div>';
+  }).join('');
+}
+
+function renderSummary() {
+  syncSummaryMonthOptions();
+  var titleEl = $('summaryTitle');
+  if (!summaryMonth) {
+    if (titleEl) titleEl.textContent = '经营汇总';
+    $('sumInquiries').innerHTML = '0 <span class="unit">条</span>';
+    $('sumConverted').innerHTML = '0 <span class="unit">位</span>';
+    $('sumConvertedSub').textContent = '期间去重 · 0 笔已确认订单';
+    $('sumSalesUsd').textContent = 'US$0.00';
+    $('sumProfit').textContent = '¥0.00';
+    $('sumProfitSub').textContent = '0 / 0 笔可计算';
+    $('sumSalesCny').textContent = '¥0.00';
+    $('sumSalesCnySub').textContent = '逐单用该订单汇率';
+    $('sumEstProfit').textContent = '¥0.00';
+    $('sumEstProfitSub').textContent = '0 / 0 笔可计算；与已核对利润分开查看';
+    $('sumRate').textContent = '0.0%';
+    $('sumRateSub').textContent = '本期收到的 0 条中，当前 0 条已成交';
+    $('summaryChart').innerHTML = '<div class="empty">暂无数据。请先导入订单与询盘。</div>';
+    $('summaryDaily').innerHTML = '<div class="empty">暂无数据。请先导入订单与询盘。</div>';
+    return;
+  }
+  var s = computeMonthlySummary(state.orders, state.inquiries, state.history, state.customers, summaryMonth);
+  var y = summaryMonth.slice(0, 4), m = parseInt(summaryMonth.slice(5, 7), 10);
+  if (titleEl) titleEl.textContent = y + ' 年 ' + m + ' 月 经营汇总';
+  $('sumInquiries').innerHTML = s.inquiries + ' <span class="unit">条</span>';
+  $('sumConverted').innerHTML = s.convertedCustomers + ' <span class="unit">位</span>';
+  $('sumConvertedSub').textContent = '期间去重 · ' + s.confirmedOrders + ' 笔已确认订单';
+  $('sumSalesUsd').textContent = fmtUSD(s.salesUsd);
+  $('sumProfit').textContent = fmtCNY(s.verifiedProfit);
+  $('sumProfitSub').textContent = s.verifiedA + ' / ' + s.verifiedB + ' 笔可计算';
+  $('sumSalesCny').textContent = fmtCNY(s.salesCny);
+  $('sumSalesCnySub').textContent = '逐单用该订单汇率' + (s.missingSales ? '；待补 ' + s.missingSales + ' 笔（缺金额或汇率，不计为 0）' : '');
+  $('sumEstProfit').textContent = fmtCNY(s.estimatedProfit);
+  $('sumEstProfitSub').textContent = s.estA + ' / ' + s.estB + ' 笔可计算；与已核对利润分开查看';
+  $('sumRate').textContent = s.conversionRate.toFixed(1) + '%';
+  $('sumRateSub').textContent = '本期收到的 ' + s.conversionDen + ' 条中，当前 ' + s.conversionNum + ' 条已成交';
+  renderSummaryChart(s);
+  var rows = s.daily.map(function (d) {
+    return '<tr><td>' + esc(d.date) + '</td><td>' + d.inquiries + '</td><td>' + d.converted + '</td><td>' + d.orders + '</td>' +
+      '<td>' + esc(fmtUsd0(d.salesUsd)) + '</td><td>' + esc(fmtCny0(d.salesCny)) + '</td>' +
+      '<td>' + esc(fmtCny0(d.verifiedProfit)) + '</td><td>' + esc(fmtCny0(d.estimatedProfit)) + '</td></tr>';
+  }).join('');
+  $('summaryDaily').innerHTML = '<table class="follow-table"><thead><tr><th>日期</th><th>询盘</th><th>成交客户</th><th>订单</th><th>销售额 USD</th><th>折算 CNY</th><th>已核对利润</th><th>预计利润</th></tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
 function renderAll() {
   renderCards();
   renderFollowList();
@@ -597,6 +1451,9 @@ function renderAll() {
   renderTodos();
   renderCustomers();
   renderReview();
+  renderOrders();
+  renderSuppliers();
+  renderSummary();
 }
 
 // ---------- 保存 / 人工复核 ----------
@@ -729,6 +1586,88 @@ function addCustomer() {
   }).catch(function (e) { alert('保存失败：' + e.message); });
 }
 
+// ---------- 项目与订单：新建 ----------
+// 订单与客户的关联只按公司名精确匹配（与导入脚本同一规则）；匹配不上留空，不推断。
+function setOrderStatus(msg, isError) {
+  var el = $('orderStatus');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle('error', !!isError);
+}
+function addOrder() {
+  var fields = {};
+  document.querySelectorAll('#orderForm [data-f]').forEach(function (inp) { fields[inp.dataset.f] = inp.value.trim(); });
+  if (!fields.order_no || !fields.title) { alert('请至少填写订单编号和项目 / 产品'); return; }
+  if (!hasKey) { alert('未配置 Supabase key，无法保存'); return; }
+  var numOrNull = function (v) { return v === '' ? null : parseFloat(v); };
+  var row = {
+    order_no: fields.order_no, title: fields.title,
+    order_date: fields.order_date || null,
+    stage: fields.stage || '打样',
+    customer_company: fields.customer_company || '',
+    customer_contact: fields.customer_contact || '',
+    amount_usd: numOrNull(fields.amount_usd),
+    received_usd: numOrNull(fields.received_usd),
+    exchange_rate: numOrNull(fields.exchange_rate),
+    cost_rmb: numOrNull(fields.cost_rmb),
+    cost_note: fields.cost_note || '',
+    profit_rmb: numOrNull(fields.profit_rmb),
+    profit_rate: numOrNull(fields.profit_rate),
+    profit_status: fields.profit_status || '待确认',
+    customer_id: null
+  };
+  var match = null;
+  state.customers.forEach(function (c) {
+    if (!match && String(c.company || '').trim() &&
+        String(c.company || '').trim() === String(row.customer_company).trim()) match = c;
+  });
+  if (match) row.customer_id = match.id;
+  setOrderStatus('正在保存……');
+  sbInsert('followup_orders', row).then(function (inserted) {
+    var fresh = inserted && inserted[0] ? inserted[0] : row;
+    state.orders.unshift(fresh);
+    document.querySelectorAll('#orderForm [data-f]').forEach(function (inp) {
+      if (inp.tagName === 'SELECT') {
+        if (inp.dataset.f === 'profit_status') inp.value = '待确认';
+        else if (inp.options.length) inp.value = inp.options[0].value;
+      } else inp.value = '';
+    });
+    setOrderStatus('已添加订单 ' + row.order_no + '。');
+    renderAll();
+  }).catch(function (e) { setOrderStatus('保存失败：' + e.message, true); });
+}
+
+// ---------- 供应商与物流：新建 ----------
+// 空字段存空字符串，不编造“待补充”写进库；显示时按旧站占位渲染（见 renderSuppliers）。
+function setSupplierStatus(msg, isError) {
+  var el = $('supplierStatus');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle('error', !!isError);
+}
+function addSupplier() {
+  var fields = {};
+  document.querySelectorAll('#supplierForm [data-f]').forEach(function (inp) { fields[inp.dataset.f] = inp.value.trim(); });
+  if (!fields.name) { alert('请填写伙伴名称'); return; }
+  if (!hasKey) { alert('未配置 Supabase key，无法保存'); return; }
+  var row = {
+    name: fields.name, kind: fields.kind || '供应商',
+    contact: fields.contact || '', contact_info: fields.contact_info || '',
+    service_or_route: fields.service_or_route || '', detail_count: 0
+  };
+  setSupplierStatus('正在保存……');
+  sbInsert('followup_suppliers', row).then(function (inserted) {
+    var fresh = inserted && inserted[0] ? inserted[0] : row;
+    state.suppliers.unshift(fresh);
+    document.querySelectorAll('#supplierForm [data-f]').forEach(function (inp) {
+      if (inp.tagName === 'SELECT') inp.value = '供应商';
+      else inp.value = '';
+    });
+    setSupplierStatus('已添加伙伴 ' + row.name + '。');
+    renderAll();
+  }).catch(function (e) { setSupplierStatus('保存失败：' + e.message, true); });
+}
+
 // ---------- v3：导出 CSV（当前筛选结果，全部字段，每日上限） ----------
 // 导出的是当前跟进清单的筛选结果（筛选 + 搜索都生效），一行一条询盘；
 // 没有询盘的客户也各占一行（询盘字段留空），所以导出的客户不会丢。
@@ -851,24 +1790,33 @@ function syncEmail() {
 
 // ---------- 加载 ----------
 function loadAll() {
+  selectedCustomerIds = {}; // 重新加载后旧的勾选作废，避免删到已不存在的客户
   if (!hasKey) {
     state.customers = []; state.inquiries = []; state.emails = [];
+    state.orders = []; state.suppliers = []; state.history = [];
     setStatus('未配置 Supabase anon key：请复制 config.example.js 为 config.js 并填入真实 key，导入真实数据后这里会显示 216 位客户 / 201 条询盘。');
     renderAll();
     return;
   }
-  setStatus('正在从 Supabase 加载客户、询盘与邮件……');
+  setStatus('正在从 Supabase 加载客户、询盘、订单与邮件……');
   Promise.all([
     sbList('followup_customers', 'updated_at.desc').catch(function (e) { throw new Error('客户档案：' + e.message); }),
     sbList('followup_inquiries', 'created_at.desc').catch(function (e) { throw new Error('询盘：' + e.message); }),
     sbList('followup_emails', 'sent_at.desc').catch(function (e) { throw new Error('邮件：' + e.message); }),
     // 注意：followup_sync_state 表没有 created_at 列，不能用默认排序，改按 updated_at
-    sbList('followup_sync_state', 'updated_at.desc').catch(function () { return []; })
+    sbList('followup_sync_state', 'updated_at.desc').catch(function () { return []; }),
+    sbList('followup_orders', 'created_at.desc').catch(function (e) { throw new Error('项目与订单：' + e.message); }),
+    sbList('followup_suppliers', 'created_at.desc').catch(function (e) { throw new Error('供应商与物流：' + e.message); }),
+    // 跟进历史 310 行：经营汇总的“首次进入已成交”按它推导；PostgREST 默认上限 1000 行，一次够
+    sbList('followup_history', 'created_at.desc').catch(function (e) { throw new Error('跟进历史：' + e.message); })
   ]).then(function (results) {
     state.customers = results[0] || [];
     state.inquiries = results[1] || [];
     state.emails = results[2] || [];
     state.syncState = (results[3] && results[3][0]) || null;
+    state.orders = results[4] || [];
+    state.suppliers = results[5] || [];
+    state.history = results[6] || [];
     // 本次会话刚同步过：保留同步结果的完整数字，不被这里的“上次同步”一行盖掉
     // （旧版盖掉后页面上只剩一行，看不到拉取/新增/匹配/待判断的分项数字）。
     if (lastSyncSummaryText) { $('syncStatus').textContent = lastSyncSummaryText; }
@@ -882,6 +1830,7 @@ function loadAll() {
     // 任一表加载失败：只报错，不用假数据填充，避免把示例当成真实数据。
     setStatus('加载失败：' + e.message + '（请先在 Supabase SQL Editor 执行 supabase-followup.sql 建表，再按 README 第 5 步导入）', true);
     state.customers = []; state.inquiries = []; state.emails = [];
+    state.orders = []; state.suppliers = []; state.history = [];
     renderAll();
     $('followList').innerHTML = '<div class="empty error-box">加载失败：' + esc(e.message) + '</div>';
   });
@@ -906,13 +1855,76 @@ function init() {
   });
   $('searchBox').addEventListener('input', function () { searchText = $('searchBox').value.trim(); renderFollowList(); });
   $('searchAll').addEventListener('input', function () { allSearchText = $('searchAll').value.trim(); renderAllInquiries(); });
+  // 项目与订单：类型 / 客户 / 阶段筛选 + 搜索 + 刷新 + 新建
+  $('filterOrderType').addEventListener('change', function () { orderTypeFilter = $('filterOrderType').value; renderOrders(); });
+  $('filterOrderCustomer').addEventListener('change', function () { orderCustomerFilter = $('filterOrderCustomer').value; renderOrders(); });
+  $('filterOrderStage').addEventListener('change', function () { orderStageFilter = $('filterOrderStage').value; renderOrders(); });
+  $('searchOrders').addEventListener('input', function () { orderSearchText = $('searchOrders').value.trim(); renderOrders(); });
+  $('refreshOrdersBtn').addEventListener('click', loadAll);
+  $('addOrderBtn').addEventListener('click', addOrder);
+  $('addOrderBtnTop').addEventListener('click', function () {
+    var f = $('orderForm');
+    if (!f) return;
+    f.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    var first = f.querySelector('[data-f="order_no"]');
+    if (first) first.focus();
+  });
+  // 经营汇总：月份切换 + 刷新
+  $('summaryMonth').addEventListener('change', function () { summaryMonth = $('summaryMonth').value; renderSummary(); });
+  $('refreshSummaryBtn').addEventListener('click', loadAll);
+  // 供应商与物流：搜索 + 类型筛选 + 刷新 + 新建
+  $('searchSuppliers').addEventListener('input', function () { supplierSearchText = $('searchSuppliers').value.trim(); renderSuppliers(); });
+  $('filterSupplierKind').addEventListener('change', function () { supplierKindFilter = $('filterSupplierKind').value; renderSuppliers(); });
+  $('refreshSuppliersBtn').addEventListener('click', loadAll);
+  $('addSupplierBtn').addEventListener('click', addSupplier);
+  $('addSupplierBtnTop').addEventListener('click', function () {
+    var f = $('supplierForm');
+    if (!f) return;
+    f.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    var first = f.querySelector('[data-f="name"]');
+    if (first) first.focus();
+  });
   $('searchCustomers').addEventListener('input', function () { customerSearchText = $('searchCustomers').value.trim(); renderCustomers(); });
+  $('filterCustomerType').addEventListener('change', function () { customerTypeFilter = $('filterCustomerType').value; renderCustomers(); });
+  $('filterCustomerGrade').addEventListener('change', function () { customerGradeFilter = $('filterCustomerGrade').value; renderCustomers(); });
+  $('batchDeleteBtn').addEventListener('click', batchDeleteCustomers);
+  $('importCustomersBtn').addEventListener('click', function () { $('importCustomersFile').click(); });
+  $('importCustomersFile').addEventListener('change', function () { handleImportFile($('importCustomersFile').files[0]); });
+  $('exportCustomersBtn').addEventListener('click', exportCustomersExcel);
+  $('refreshCustomersBtn').addEventListener('click', loadAll);
+  // 表格复选框（事件委托；每点一次重渲染，勾选状态存在 selectedCustomerIds 里，不会丢）
+  document.addEventListener('change', function (e) {
+    var t = e.target;
+    if (t.hasAttribute('data-select-all-customers')) {
+      var rows = filteredCustomers();
+      rows.forEach(function (c) {
+        if (t.checked) selectedCustomerIds[String(c.id)] = true;
+        else delete selectedCustomerIds[String(c.id)];
+      });
+      renderCustomers();
+      return;
+    }
+    if (t.dataset.selectCustomer) {
+      if (t.checked) selectedCustomerIds[t.dataset.selectCustomer] = true;
+      else delete selectedCustomerIds[t.dataset.selectCustomer];
+      renderCustomers();
+    }
+  });
   $('syncBtn').addEventListener('click', syncEmail);
   $('exportBtn').addEventListener('click', exportCsv);
   $('refreshBtn').addEventListener('click', loadAll);
   $('addCustomerBtn').addEventListener('click', addCustomer);
   document.addEventListener('click', function (e) {
     var t = e.target;
+    // 订单行点客户名称：只看该客户的项目与订单；再点一次取消筛选
+    if (t.dataset.filterOrderCustomer) {
+      var co = t.dataset.filterOrderCustomer;
+      orderCustomerFilter = (orderCustomerFilter === co) ? '' : co;
+      var sel = $('filterOrderCustomer');
+      if (sel) sel.value = orderCustomerFilter;
+      renderOrders();
+      return;
+    }
     if (t.dataset.editInquiry) { editingId = t.dataset.editInquiry; renderAll(); return; }
     if (t.dataset.saveInquiry) { saveInquiry(t.dataset.saveInquiry); return; }
     if (t.dataset.cancelEdit) { editingId = null; renderAll(); return; }
@@ -959,6 +1971,18 @@ if (typeof module !== 'undefined' && module.exports) {
     checkExportCap: checkExportCap,
     emailDomain: emailDomain,
     isFreeDomain: isFreeDomain,
-    verificationLabel: verificationLabel
+    verificationLabel: verificationLabel,
+    // 项目与订单 / 经营汇总（单测用）
+    isConfirmedOrder: isConfirmedOrder,
+    isCancelledOrder: isCancelledOrder,
+    orderTypeOf: orderTypeOf,
+    orderCny: orderCny,
+    round2: round2,
+    beijingDate: beijingDate,
+    firstClosedDateByInquiry: firstClosedDateByInquiry,
+    computeMonthlySummary: computeMonthlySummary,
+    fmtUSD: fmtUSD,
+    fmtCNY: fmtCNY,
+    orderProfitCell: orderProfitCell
   };
 }

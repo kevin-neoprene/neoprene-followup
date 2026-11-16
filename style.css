@@ -86,10 +86,40 @@ button.small{padding:5px 9px;font-size:13px}
 .edit-row td{background:#f9fafb}
 .edit-row input,.edit-row select{width:100%;margin-bottom:6px}
 .row-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
-/* 客户档案表 */
+/* 客户档案（旧系统样式：标题 + 导入/导出 + 批量删除 + 宽松 6 列表格） */
+.cust-head{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;justify-content:space-between;margin-bottom:8px}
+.cust-head h2{margin:0;font-size:20px}
+.cust-head .subtitle{margin:4px 0 0}
+.count-pill{display:inline-block;background:#f3f4f6;color:var(--muted);font-size:12px;font-weight:600;border-radius:999px;padding:1px 9px;vertical-align:middle;margin-left:4px}
+.count-pill:empty{display:none}
+.cust-head-actions{display:flex;gap:8px;align-items:center}
+.cust-note{margin:0 0 14px}
+.batch-bar{display:flex;gap:10px;align-items:center;background:#fef2f2;border:1px solid #fee2e2;border-radius:10px;padding:8px 12px;margin-bottom:12px}
+.batch-bar .muted{font-size:13px}
+.batch-bar button:disabled{opacity:.45;cursor:not-allowed}
 .cust-table{width:100%;border-collapse:collapse;font-size:14px}
-.cust-table th{text-align:left;color:var(--muted);font-weight:600;font-size:13px;padding:8px;border-bottom:1px solid var(--border)}
-.cust-table td{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+.cust-table th{text-align:left;color:var(--muted);font-weight:600;font-size:13px;padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowrap}
+.cust-table td{padding:18px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+.cust-table tr:last-child td{border-bottom:0}
+.cust-table .check-col{width:34px;text-align:center}
+.cust-table .check-col input{width:16px;height:16px;cursor:pointer}
+.cust-id{display:flex;gap:12px;align-items:flex-start}
+.cust-avatar{flex:0 0 44px;width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700}
+.cust-company{font-weight:600;font-size:15px}
+.cust-sub{color:var(--muted);font-size:13px;margin-top:3px}
+.cust-bg{color:var(--green);font-size:13px;margin-top:3px}
+.cust-advice{color:var(--muted);font-size:13px;margin-top:8px}
+.grade-pill{display:inline-block;padding:3px 12px;border-radius:6px;font-size:13px;font-weight:600;white-space:nowrap}
+.grade-a{background:#dcfce7;color:#166534}
+.grade-b{background:#dbeafe;color:#1d4ed8}
+.grade-c{background:#f3f4f6;color:#78716c}
+.grade-pending{background:#f3f4f6;color:#374151}
+.type-pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;background:#e6f4ea;color:#166534;margin-top:8px;white-space:nowrap}
+.type-pill.type-missing{background:#f3f4f6;color:#6b7280}
+.wa-btn{display:inline-block;margin-top:8px;padding:5px 10px;border:1px solid #86efac;border-radius:8px;background:#f0fdf4;color:#15803d;font-size:13px;text-decoration:none;white-space:nowrap}
+.wa-btn:hover{background:#dcfce7}
+.inq-num{font-size:20px;font-weight:700}
+.cust-table .chev{color:#9ca3af;font-size:20px;width:24px;text-align:right}
 /* 待判断邮件卡片 */
 .review-card{border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:12px}
 .review-card .r-subject{font-weight:600}
@@ -103,6 +133,28 @@ button.small{padding:5px 9px;font-size:13px}
 .add-row{display:flex;flex-wrap:wrap;gap:8px}
 .form-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-bottom:14px}
 .form-grid button{grid-column:1/-1;justify-self:start}
+/* 项目与订单 / 供应商与物流 / 经营汇总 */
+.btn-dark{background:var(--dark);color:#fff}
+.btn-dark:hover{background:#2a3f3c}
+.link-btn{background:none;border:0;color:var(--text);font-weight:600;padding:0;text-align:left;text-decoration:underline;text-underline-offset:2px}
+.link-btn:hover{color:var(--accent)}
+.order-table td,.supplier-table td{padding:18px 10px}
+.follow-table .chev{color:#9ca3af;font-size:20px;width:24px;text-align:right}
+.o-profit-state{font-weight:600;color:#166534}
+.card h3{font-size:16px;margin:0 0 10px}
+.summary-cards{margin-bottom:16px}
+.card-stat.highlight{background:#eef6e3}
+.card-stat .unit{font-size:15px;font-weight:400;color:var(--muted)}
+.summary-lines{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
+.sum-line b{font-size:17px}
+.sum-line .muted{margin-top:2px}
+/* 每日实际利润柱状图：纯 CSS div 柱子，底部对齐，数值写在日期下方 */
+.bar-chart{display:flex;align-items:flex-end;gap:2px;overflow-x:auto;padding:12px 4px 4px;border-bottom:1px solid var(--border)}
+.bar-col{flex:0 0 54px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end}
+.bar{width:26px;background:#7ba05b;border-radius:3px 3px 0 0}
+.bar-dash{width:26px;border-top:2px dashed #cbd5e1;height:0;margin-bottom:2px}
+.bar-day{font-size:12px;color:var(--muted);margin-top:6px}
+.bar-val{font-size:11px;color:var(--muted);white-space:nowrap;margin-top:2px}
 @media(max-width:860px){
   .app{flex-direction:column}
   .sidebar{width:100%;flex:none;padding:14px 16px}
@@ -110,4 +162,5 @@ button.small{padding:5px 9px;font-size:13px}
   .nav-item{width:auto}
   .cards{grid-template-columns:repeat(2,1fr)}
   .follow-table,.cust-table{font-size:13px}
+  .summary-lines{grid-template-columns:1fr}
 }

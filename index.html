@@ -21,6 +21,9 @@
     <nav class="side-nav" id="sideNav">
       <button class="nav-item active" data-view="workbench"><span class="nav-ico">▦</span>跟进工作台</button>
       <button class="nav-item" data-view="customers"><span class="nav-ico">◉</span>客户档案<span class="nav-count" id="customerCount"></span></button>
+      <button class="nav-item" data-view="orders"><span class="nav-ico">▧</span>项目与订单<span class="nav-count" id="orderCount"></span></button>
+      <button class="nav-item" data-view="summary"><span class="nav-ico">▥</span>经营汇总与报表</button>
+      <button class="nav-item" data-view="suppliers"><span class="nav-ico">▣</span>供应商与物流<span class="nav-count" id="supplierCount"></span></button>
       <button class="nav-item" data-view="all"><span class="nav-ico">▤</span>全部询盘<span class="nav-count" id="allCount"></span></button>
       <button class="nav-item" data-view="review"><span class="nav-ico">◐</span>回复待判断<span class="nav-count" id="reviewCount"></span></button>
     </nav>
@@ -79,9 +82,38 @@
         <div id="todoList"><div class="empty">加载中……</div></div>
       </section>
 
-      <!-- 客户档案 -->
+      <!-- 客户档案（旧系统样式：标题 + 导入/导出 + 搜索/筛选 + 批量删除 + 宽松 6 列表格） -->
       <section class="card tabpane" id="pane-customers">
-        <h2>客户档案</h2>
+        <div class="cust-head">
+          <div>
+            <h2>客户档案 <span class="count-pill" id="customerCountPill"></span></h2>
+            <p class="subtitle">一份客户资料，关联每一次询盘与沟通。</p>
+          </div>
+          <div class="cust-head-actions">
+            <button class="ghost" id="importCustomersBtn">⬆ 导入客户 Excel</button>
+            <button class="ghost" id="exportCustomersBtn">⬇ 导出全部客户 Excel</button>
+            <button class="ghost" id="refreshCustomersBtn" title="刷新客户档案">↻</button>
+            <input type="file" id="importCustomersFile" accept=".xlsx,.csv" hidden>
+          </div>
+        </div>
+        <p class="muted cust-note">可导入其他渠道的 .xlsx / CSV；导出包含当前账号全部客户及关联询盘、备注和沟通，不受下方筛选影响。</p>
+        <div class="toolbar">
+          <input type="search" id="searchCustomers" placeholder="搜索公司、联系人、邮箱或国家…">
+          <select id="filterCustomerType" title="按客户类型筛选">
+            <option value="">全部客户类型</option>
+          </select>
+          <select id="filterCustomerGrade" title="按重要等级筛选">
+            <option value="">全部重要等级</option>
+          </select>
+        </div>
+        <div class="batch-bar">
+          <button class="ghost" id="batchDeleteBtn" disabled>🗑 批量删除</button>
+          <span class="muted">勾选客户后可批量删除。删除会连同该客户的询盘、跟进记录和待办一起删除，已同步邮件会保留但取消关联，请谨慎操作。</span>
+        </div>
+        <p class="status" id="customerStatus"></p>
+        <div id="customerList"><div class="empty">加载中……</div></div>
+
+        <h2 style="margin-top:22px">添加客户</h2>
         <div class="add-row form-grid" id="customerForm">
           <input type="text" data-f="name" placeholder="客户姓名 *">
           <input type="text" data-f="company" placeholder="公司">
@@ -99,10 +131,124 @@
           </select>
           <button id="addCustomerBtn">添加客户</button>
         </div>
-        <div class="toolbar">
-          <input type="search" id="searchCustomers" placeholder="搜索客户、公司或邮箱…">
+      </section>
+
+      <!-- 项目与订单（旧系统样式：标题 + 搜索/筛选 + 宽松 6 列表格） -->
+      <section class="card tabpane" id="pane-orders">
+        <div class="cust-head">
+          <div>
+            <h2>项目与订单成本 <span class="count-pill" id="orderCountPill"></span></h2>
+            <p class="subtitle">点击客户名称筛选该客户的项目与订单。累计订单数与经营汇总使用相同的确认阶段。</p>
+          </div>
+          <div class="cust-head-actions">
+            <button class="ghost" id="refreshOrdersBtn" title="刷新项目与订单">↻</button>
+            <button class="btn-dark" id="addOrderBtnTop">+ 新建项目 / 订单</button>
+          </div>
         </div>
-        <div id="customerList"><div class="empty">加载中……</div></div>
+        <div class="toolbar">
+          <select id="filterOrderType" title="按订单类型筛选">
+            <option value="">全部订单类型</option>
+          </select>
+          <input type="search" id="searchOrders" placeholder="搜索客户、订单、产品或单号…">
+          <select id="filterOrderCustomer" title="按客户筛选">
+            <option value="">全部客户</option>
+          </select>
+          <select id="filterOrderStage" title="按阶段筛选">
+            <option value="">全部阶段</option>
+          </select>
+        </div>
+        <p class="status" id="orderStatus"></p>
+        <div id="orderList"><div class="empty">加载中……</div></div>
+
+        <h2 style="margin-top:22px">新建项目 / 订单</h2>
+        <div class="add-row form-grid" id="orderForm">
+          <input type="text" data-f="order_no" placeholder="订单编号 *">
+          <input type="text" data-f="title" placeholder="项目 / 产品 *">
+          <input type="date" data-f="order_date" title="订单日期">
+          <select data-f="stage" title="阶段"></select>
+          <input type="text" data-f="customer_company" placeholder="客户公司">
+          <input type="text" data-f="customer_contact" placeholder="客户联系人">
+          <input type="number" step="0.01" min="0" data-f="amount_usd" placeholder="销售总额 USD">
+          <input type="number" step="0.01" min="0" data-f="received_usd" placeholder="已收 USD">
+          <input type="number" step="0.01" min="0" data-f="exchange_rate" placeholder="本单汇率">
+          <input type="number" step="0.01" min="0" data-f="cost_rmb" placeholder="已录实际成本 RMB">
+          <input type="text" data-f="cost_note" placeholder="成本备注">
+          <input type="number" step="0.01" min="0" data-f="profit_rmb" placeholder="订单利润 RMB">
+          <input type="number" step="0.01" min="0" data-f="profit_rate" placeholder="利润率 %（如 82.31）">
+          <select data-f="profit_status" title="利润状态">
+            <option value="待确认" selected>利润状态：待确认</option>
+            <option value="预计">利润状态：预计</option>
+            <option value="已核对">利润状态：已核对</option>
+          </select>
+          <button id="addOrderBtn">添加项目 / 订单</button>
+        </div>
+      </section>
+
+      <!-- 经营汇总与报表（按统计口径现算，不写死数字） -->
+      <section class="card tabpane" id="pane-summary">
+        <div class="cust-head">
+          <div>
+            <h2 id="summaryTitle">经营汇总</h2>
+            <p class="subtitle">按台账日期统计。销售额包含已确认订单及已核对实际利润的项目。</p>
+          </div>
+          <div class="cust-head-actions">
+            <select id="summaryMonth" title="选择月份"></select>
+            <button class="ghost" id="refreshSummaryBtn" title="刷新经营汇总">↻</button>
+          </div>
+        </div>
+        <div class="cards summary-cards">
+          <div class="card-stat"><span>新增询盘</span><b id="sumInquiries">0</b><small>按询盘日期计</small></div>
+          <div class="card-stat"><span>成交客户</span><b id="sumConverted">0</b><small id="sumConvertedSub">期间去重 · 0 笔已确认订单</small></div>
+          <div class="card-stat"><span>已录销售额 · USD</span><b id="sumSalesUsd">US$0.00</b><small>含已核对实际利润的项目</small></div>
+          <div class="card-stat highlight"><span>已核对实际利润 · CNY</span><b id="sumProfit">¥0.00</b><small id="sumProfitSub">0 / 0 笔可计算</small></div>
+        </div>
+        <div class="summary-lines">
+          <div class="sum-line"><b id="sumSalesCny">¥0.00</b><div class="muted">可折算人民币销售额</div><div class="muted" id="sumSalesCnySub">逐单用该订单汇率</div></div>
+          <div class="sum-line"><b id="sumEstProfit">¥0.00</b><div class="muted">预计订单利润</div><div class="muted" id="sumEstProfitSub">0 / 0 笔可计算；与已核对利润分开查看</div></div>
+          <div class="sum-line"><b id="sumRate">0.0%</b><div class="muted">本期询盘当前成交率</div><div class="muted" id="sumRateSub">本期收到的 0 条中，当前 0 条已成交</div></div>
+        </div>
+        <h3>每日实际利润</h3>
+        <p class="muted">人民币 · 按订单日期归属，展示已核对项目与订单；灰色虚线表示有订单但尚不可算。</p>
+        <div id="summaryChart" class="bar-chart"><div class="empty">加载中……</div></div>
+        <h3 style="margin-top:22px">每日明细</h3>
+        <div id="summaryDaily"><div class="empty">加载中……</div></div>
+      </section>
+
+      <!-- 供应商与物流（旧系统样式：标题 + 搜索/筛选 + 宽松 4 列表格） -->
+      <section class="card tabpane" id="pane-suppliers">
+        <div class="cust-head">
+          <div>
+            <h2>供应商与物流 <span class="count-pill" id="supplierCountPill"></span></h2>
+            <p class="subtitle">统一保存伙伴资料，在各项目的采购、打样和物流明细中关联。</p>
+          </div>
+          <div class="cust-head-actions">
+            <button class="ghost" id="refreshSuppliersBtn" title="刷新供应商与物流">↻</button>
+            <button class="btn-dark" id="addSupplierBtnTop">+ 新建供应商 / 伙伴</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <input type="search" id="searchSuppliers" placeholder="搜索供应商、物流商或服务…">
+          <select id="filterSupplierKind" title="按伙伴类型筛选">
+            <option value="">全部伙伴</option>
+            <option value="供应商">供应商</option>
+            <option value="物流商">物流商</option>
+          </select>
+        </div>
+        <p class="status" id="supplierStatus"></p>
+        <div id="supplierList"><div class="empty">加载中……</div></div>
+
+        <h2 style="margin-top:22px">新建供应商 / 伙伴</h2>
+        <div class="add-row form-grid" id="supplierForm">
+          <input type="text" data-f="name" placeholder="伙伴名称 *">
+          <select data-f="kind" title="伙伴类型">
+            <option value="供应商" selected>供应商</option>
+            <option value="物流商">物流商</option>
+          </select>
+          <input type="text" data-f="contact" placeholder="联系人">
+          <input type="text" data-f="contact_info" placeholder="联系方式">
+          <input type="text" data-f="service_or_route" placeholder="材料、服务或物流线路">
+          <button id="addSupplierBtn">添加供应商 / 伙伴</button>
+        </div>
       </section>
 
       <!-- 全部询盘 -->
