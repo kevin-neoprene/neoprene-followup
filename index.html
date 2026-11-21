@@ -26,6 +26,7 @@
       <button class="nav-item" data-view="suppliers"><span class="nav-ico">▣</span>供应商与物流<span class="nav-count" id="supplierCount"></span></button>
       <button class="nav-item" data-view="all"><span class="nav-ico">▤</span>全部询盘<span class="nav-count" id="allCount"></span></button>
       <button class="nav-item" data-view="review"><span class="nav-ico">◐</span>回复待判断<span class="nav-count" id="reviewCount"></span></button>
+      <button class="nav-item" data-view="prospects"><span class="nav-ico">⌕</span>搜客池<span class="nav-count" id="prospectCount"></span></button>
     </nav>
   </aside>
 
@@ -264,6 +265,62 @@
       <section class="card tabpane" id="pane-review">
         <h2>回复待判断</h2>
         <div id="reviewList"><div class="empty">加载中……</div></div>
+      </section>
+
+      <!-- 搜客池 Phase 1：只收 Excel 名单，清洗 / 去重 / 打分 / 转客户 -->
+      <section class="card tabpane" id="pane-prospects">
+        <div class="cust-head">
+          <div>
+            <h2>搜客池 <span class="count-pill" id="prospectCountPill"></span></h2>
+            <p class="subtitle">导入名单后自动按 100 分表打分、去重，≥60 分进复核，≥80 分优先看，低于 40 分自动淘汰。只收文件，不搜客、不验邮箱。</p>
+          </div>
+          <div class="cust-head-actions">
+            <button class="ghost" id="refreshProspectsBtn" title="刷新搜客池">↻</button>
+          </div>
+        </div>
+        <div class="add-row form-grid" id="prospectImportForm">
+          <input type="text" id="prospectBatchCountry" placeholder="本批国家（如 西班牙，可空）">
+          <input type="text" id="prospectBatchKeywords" placeholder="关键词组（如 潜水服，可空）">
+          <select id="prospectBatchSource" title="名单来源（只是标签，不代表本系统连过它）">
+            <option value="来发信">来源：来发信</option>
+            <option value="DeepSeek">来源：DeepSeek</option>
+            <option value="手工导入" selected>来源：手工导入</option>
+          </select>
+          <button id="importProspectBtn">⬆ 导入名单 Excel / CSV</button>
+          <input type="file" id="importProspectFile" accept=".xlsx,.csv" hidden>
+        </div>
+        <p class="muted cust-note">第一行为表头，列名自动识别（公司/域名/国家/规模/邮箱/联系人/职位/电话/证据链接/证据摘录/证据位置/产品类别/定制信号……中英文都行）。先出预览，确认后才写库；硬规则不过、去重命中、低于 40 分的行不入池，原因都记在批次备注里。</p>
+        <div id="prospectImportPreview"></div>
+        <p class="status" id="prospectStatus"></p>
+
+        <h2 style="margin-top:22px">导入批次</h2>
+        <div id="prospectBatchList"><div class="empty">加载中……</div></div>
+
+        <h2 style="margin-top:22px">候选公司 <span class="muted" id="prospectListCount"></span></h2>
+        <div class="toolbar">
+          <input type="search" id="searchProspects" placeholder="搜索公司、域名或联系人…">
+          <select id="filterProspectCountry" title="按国家筛选">
+            <option value="">全部国家</option>
+          </select>
+          <select id="filterProspectBand" title="按分数段筛选">
+            <option value="">全部分数段</option>
+            <option value="优先">优先（≥80）</option>
+            <option value="可跟">可跟（60-79）</option>
+            <option value="备选">备选（40-59）</option>
+            <option value="淘汰">淘汰（&lt;40）</option>
+          </select>
+          <select id="filterProspectStatus" title="按状态筛选">
+            <option value="">全部状态</option>
+            <option value="待复核">待复核</option>
+            <option value="已保留">已保留</option>
+            <option value="已淘汰">已淘汰</option>
+            <option value="已转客户">已转客户</option>
+          </select>
+          <select id="filterProspectBatch" title="按批次筛选">
+            <option value="">全部批次</option>
+          </select>
+        </div>
+        <div id="prospectList"><div class="empty">加载中……</div></div>
       </section>
     </div>
   </main>

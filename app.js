@@ -30,6 +30,13 @@ var MAX_TODOS_PER_RUN = 10;
 var HEALTH_LOW = 60;
 // 终态阶段：不计入“全部进行中”（旧站：194 = 201 − 暂缓 3 − 已关闭 3 − 已成交 1）
 var TERMINAL_STAGES = ['已成交', '已关闭', '暂缓'];
+// ---------- 搜客池 Phase 1（只收 Excel 名单，清洗 / 去重 / 打分 / 转客户；
+//   不搜客、不验邮箱、不连来发信——“来发信 / DeepSeek / 手工导入”只是名单来源标签） ----------
+// 分数门槛：≥80 优先（复核队列顶部，转客户后第一条待办 +3 天）；60-79 可跟进复核；
+//   40-59 备选留池（不占待办）；<40 自动淘汰并记原因，下次搜到不再重复打分。
+var SCORE_PRIORITY_MIN = 80;
+var SCORE_REVIEW_MIN = 60;
+var SCORE_DISCARD_MAX = 40;
 // ---------- 项目与订单 / 经营汇总（与旧站经营汇总口径一致，见统计口径表） ----------
 // 确认阶段：substring 匹配——“订单确认·返单”算确认，“打样·返单”不算。
 // 45 条订单里确认 26 条；2026-11 有 2 笔（Kevin261031、kevin261102）。
@@ -71,7 +78,7 @@ var DB_STATUS_TO_KEY = {
   '待定日期': 'unscheduled', '回复待判断': 'review', '已成交': 'done', '已丢单': 'lost', '归档': 'archived'
 };
 
-var state = { customers: [], inquiries: [], emails: [], syncState: null, orders: [], suppliers: [], history: [] };
+var state = { customers: [], inquiries: [], emails: [], syncState: null, orders: [], suppliers: [], history: [], prospects: [], prospectBatches: [], prospectContacts: [], prospectCoverage: [] };
 var currentView = 'workbench';
 var currentFilter = 'all';
 var searchText = '';
@@ -96,6 +103,14 @@ var selectedCustomerIds = {}; // id -> true，跨搜索/筛选保留
 var customerFilterSig = ''; // 类型/等级下拉选项的签名，数据不变时不重建选项
 var editingId = null; // 正在行内编辑的询盘 id
 var lastSyncSummaryText = ''; // 本次会话刚同步完的完整结果行；loadAll 刷新时保留它，不被“上次同步”盖掉
+// 搜客池筛选 / 待确认的导入（预览后点确认才写库）
+var prospectCountryFilter = '';
+var prospectBandFilter = '';
+var prospectStatusFilter = '';
+var prospectBatchFilter = '';
+var prospectSearchText = '';
+var prospectFilterSig = ''; // 国家/批次下拉选项的签名，数据不变时不重建选项
+var pendingProspectImport = null; // { rows, mapping, meta, result }：预览待确认的一批
 
 // ---------- 纯函数（不碰 DOM；Node 下可通过 module.exports 单独测试） ----------
 function esc(s) {
@@ -182,6 +197,335 @@ function checkExportCap(usedToday, rowsToExport, cap) {
 }
 function exportCountKey(dateStr) { return EXPORT_COUNT_PREFIX + (dateStr || todayStr()); }
 function verificationLabel(v) { return VERIFICATION_LABELS[v] || VERIFICATION_LABELS.unverified; }
+
+// ---------- 搜客池 Phase 1：硬规则 / 打分 / 去重（纯函数，不碰 DOM；Node 下可单测） ----------
+// 规则来源：goodjob-adaptation-plan.pdf 第 5-6 页。顺序：硬规则在前（一条不过直接淘汰，
+//   不进打分、不重复收费），100 分打分在后（只按导入的结构化字段算，缺字段那一维记 0，
+//   绝不编造）。三铁方向按 PDF 第 5 页“新搜客不碰 triathlon”做硬淘汰。
+// 产品线类别（PDF 第 5 页）：片材线 + 成品线 7 类；命中其中之一 = 产品匹配满分。
+var PROSPECT_EXACT_CATEGORIES = ['潜水服', 'wetsuit', '袖套', '护具', '包袋', '鞋帽', '手套',
+  '宠物', '汽车用品', '运动配件', '片材', 'sheet', '潜水料', '氯丁橡胶片材', 'neoprene sheet'];
+// 相邻品类：同材质、不同产品（不在两条产品线里，但确实是潜水料制品）。
+var PROSPECT_ADJACENT_CATEGORIES = ['瑜伽', '鼠标垫', '杯套', '相机包', '电脑包', '潜水靴', '潜水帽',
+  '腰带', '护膝', '护肘', '泳帽', '耳带', 'yoga', 'mousepad', 'cooler', 'koozie'];
+// 潜水料证据词（硬规则用）：摘录或证据链接里出现任一词 = 有明确证据。
+var PROSPECT_EVIDENCE_WORDS = ['neoprene', 'chloroprene', '氯丁橡胶', '潜水料', 'wetsuit material', 'cr sheet', 'sbr sheet'];
+// 工业用途词（硬规则用）：命中即淘汰，哪怕证据明确。只放不会跟民用产品撞车的词
+//   （如“密封件/化工厂/采矿”）；“汽车”不放——汽车用品是民用白名单里的品类。
+var PROSPECT_INDUSTRIAL_WORDS = ['industrial', '工业用途', '工业用', 'gasket', '密封件', '化工厂',
+  'chemical plant', 'mining', '采矿', 'pipeline', 'hvac', '汽车零部件', '隔热材料', 'insulation material'];
+// 三铁方向：PDF 第 5 页“新内容和新搜客不碰 triathlon（三铁）方向”，写进硬淘汰。
+var PROSPECT_TRIATHLON_WORDS = ['triathlon', '三铁', '铁人三项'];
+// 排除国家：日本、中国（含港澳台）。国家名 + 域名后缀两道检查。
+var PROSPECT_EXCLUDED_COUNTRIES = ['日本', 'japan', '中国', 'china', '香港', 'hong kong', '澳门', 'macau', '台湾', 'taiwan'];
+var PROSPECT_EXCLUDED_DOMAIN_SUFFIXES = ['.jp', '.cn', '.hk', '.mo', '.tw'];
+// 通用邮箱前缀（只有这类邮箱 = 7 分）；决策人职位词（具名邮箱 = 15 分）。
+var GENERIC_EMAIL_PREFIXES = ['info', 'sales', 'contact', 'support', 'hello', 'office', 'admin', 'mail', 'enquiry', 'inquiry'];
+var DECISION_MAKER_ROLES = ['founder', 'ceo', 'owner', '创始人', '总经理', '董事', 'president',
+  'managing director', '采购', '产品经理', 'purchasing', 'procurement', 'product manager', 'sourcing'];
+// 僵尸站信号：规模与活跃度那一维直接扣到 3 分。
+var PROSPECT_STALE_WORDS = ['僵尸', '停滞', '未更新', 'stale', 'inactive', 'dead site'];
+
+function containsWord(haystack, words) {
+  var h = String(haystack || '').toLowerCase();
+  for (var i = 0; i < words.length; i++) if (h.indexOf(words[i]) !== -1) return words[i];
+  return null;
+}
+// 域名归一化：去协议、去 www、去路径/参数、小写。空返回 ''。
+function normalizeDomain(d) {
+  var s = String(d || '').trim().toLowerCase();
+  s = s.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].split('?')[0].split('#')[0].trim();
+  return s;
+}
+// 公司名归一化（去重用）：小写、去空格标点、去尾部公司后缀。
+function normalizeCompanyName(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[\s\.,&'’\-_/()（）【】\[\]]+/g, '')
+    .replace(/(limited|ltd|inc|llc|gmbh|pty|bv|sas|sa|ag|kk|company|有限|公司)$/g, '');
+}
+// 规模解析：字段可能是 "11-50"、"50"、"11–50 人"，或 size_min/size_max 两列。
+// 返回 { min, max } 或 null（未提供——硬规则不淘汰，打分那一维记 0）。
+function parseProspectSize(sizeText, sizeMin, sizeMax) {
+  var nums = String(sizeText || '').match(/\d+/g);
+  var min = (sizeMin !== null && sizeMin !== undefined && sizeMin !== '') ? parseInt(sizeMin, 10) : null;
+  var max = (sizeMax !== null && sizeMax !== undefined && sizeMax !== '') ? parseInt(sizeMax, 10) : null;
+  if ((min === null || isNaN(min)) && nums && nums.length) min = parseInt(nums[0], 10);
+  if ((max === null || isNaN(max)) && nums && nums.length > 1) max = parseInt(nums[1], 10);
+  if (min === null || isNaN(min)) min = null;
+  if (max === null || isNaN(max)) max = null;
+  if (min === null && max === null) return null;
+  if (max === null) max = min;
+  if (min === null) min = max;
+  return { min: min, max: max };
+}
+
+// 硬规则（一条不过直接淘汰，不进打分；返回 { ok, reason }，reason 为中文淘汰原因）。
+// 检查顺序：证据 → 用途（含三铁）→ 国家 → 规模 → 官网。
+function checkProspectHardRules(row) {
+  var evidenceText = (row.evidence_excerpt || '') + ' ' + (row.evidence_url || '');
+  var useText = (row.product_category || '') + ' ' + (row.industry || '') + ' ' + (row.evidence_excerpt || '');
+  var domain = normalizeDomain(row.domain || row.website || '');
+  var country = String(row.country || '').trim();
+  // 1) 证据：摘录含潜水料词，或证据位置是图片质感判断（摘录里写了质感）。
+  var hasEvidence = !!containsWord(evidenceText, PROSPECT_EVIDENCE_WORDS) ||
+    (row.evidence_level === 'image' && String(row.evidence_excerpt || '').trim() !== '');
+  if (!hasEvidence) return { ok: false, reason: '无明确潜水料证据' };
+  // 2) 用途：只留民用、商用；工业用途淘汰（哪怕证据明确）；三铁方向不做。
+  var ind = containsWord(useText, PROSPECT_INDUSTRIAL_WORDS);
+  if (ind) return { ok: false, reason: '工业用途：' + ind };
+  var tri = containsWord(useText, PROSPECT_TRIATHLON_WORDS);
+  if (tri) return { ok: false, reason: '三铁方向不做：' + tri };
+  // 3) 国家：排除日本、中国（含港澳台域名）。
+  if (containsWord(country, PROSPECT_EXCLUDED_COUNTRIES)) return { ok: false, reason: '国家排除：' + country };
+  var suffixHit = null;
+  PROSPECT_EXCLUDED_DOMAIN_SUFFIXES.forEach(function (s) { if (domain && domain.endsWith(s)) suffixHit = s; });
+  if (suffixHit) return { ok: false, reason: '国家排除：域名后缀 ' + suffixHit };
+  // 4) 规模：2-500 人；规模未提供不淘汰（打分那一维记 0），明确 <2 或 >500 才淘汰。
+  var size = parseProspectSize(row.size_text, row.size_min, row.size_max);
+  if (size && (size.max < 2 || size.min > 500)) {
+    return { ok: false, reason: '规模不在 2-500 人：' + (row.size_text || (size.min + '-' + size.max)) };
+  }
+  // 5) 官网：一人作坊 / 无官网只有社媒的淘汰（域名和网址都空 = 无官网）。
+  if (!domain) return { ok: false, reason: '无官网（只有社媒或无网址）' };
+  return { ok: true, reason: '' };
+}
+
+// 从导入的结构化字段推断打分信号（只分类已提供的字段，不编造；推断不出 = ''，对应维度记 0）。
+// 证据位置：文件里有 证据位置 列就直接用；没有就从摘录关键词推断；摘录有潜水料证据但
+//   看不出位置时默认 product_page（25 分）——摘录本身就是从网站产品内容里摘的，
+//   这是分类已提供的数据，不是编造新证据；位置完全无法判断又无摘录的行，
+//   硬规则已在前面淘汰，不会走到这里。
+function detectProspectSignals(row) {
+  var text = ((row.evidence_excerpt || '') + ' ' + (row.evidence_url || '')).toLowerCase();
+  var cat = String(row.product_category || '').toLowerCase();
+  var catText = cat + ' ' + text;
+  var oemText = ((row.oem_text || '') + ' ' + (row.evidence_excerpt || '')).toLowerCase();
+  var level = row.evidence_level || '';
+  if (!level) {
+    if (/(blog|博客|新闻|news)/.test(text)) level = 'blog';
+    else if (/(图片|质感|texture|matte)/.test(text)) level = 'image';
+    else if (/(在售|add to cart|buy now|立即购买|加入购物车|checkout)/.test(text)) level = 'site_sale';
+    else level = 'product_page';
+  }
+  var fit = containsWord(catText, PROSPECT_EXACT_CATEGORIES) ? 'exact'
+    : (containsWord(catText, PROSPECT_ADJACENT_CATEGORIES) ? 'adjacent' : '');
+  var productLine = /(片材|sheet|foam|发泡)/.test(catText) ? '片材' : '成品';
+  var oem = /(custom|oem|private label|wholesale|定制|代工|批发|odm)/.test(oemText) ? 'oem'
+    : (/(retail|零售|专卖店)/.test(oemText) ? 'retail' : '');
+  var email = normalizeEmail(row.contact_email || row.email || '');
+  var role = String(row.contact_role || '').toLowerCase();
+  var generic = !!email && GENERIC_EMAIL_PREFIXES.indexOf(email.split('@')[0]) !== -1;
+  var isDM = !!containsWord(role, DECISION_MAKER_ROLES);
+  // 具名决策人邮箱 15 分；只有通用邮箱 7 分；无邮箱 0 分（且不能转客户）。
+  // 具名但职位不在决策人清单里（如 Sales Manager）按 7 分计——规格只认了上述职位，
+  // 不替文件里没写的职位背书。
+  var contactType = !email ? 'none' : ((isDM && !generic) ? 'named' : 'generic');
+  var size = parseProspectSize(row.size_text, row.size_min, row.size_max);
+  var stale = !!containsWord(row.activity_text || '', PROSPECT_STALE_WORDS);
+  var sizeBand = '';
+  if (size) {
+    if (size.min >= 11 && size.max <= 200) sizeBand = 'mid';
+    else sizeBand = 'edge';
+  }
+  var hasPhone = !!(String(row.phone || '').trim() || String(row.whatsapp || '').trim());
+  var contactComplete = !email ? 'none' : (hasPhone ? 'full' : 'email_only');
+  return {
+    evidenceLevel: level, productFit: fit, productLine: productLine, oemSignal: oem,
+    contactType: contactType, sizeBand: sizeBand, siteStale: stale, contactComplete: contactComplete
+  };
+}
+
+// 100 分打分（只做算术，不查任何外部数据；缺字段的维度记 0）。
+function scoreProspect(s) {
+  var parts = {
+    evidence: s.evidenceLevel === 'site_sale' ? 35 : s.evidenceLevel === 'product_page' ? 25
+      : s.evidenceLevel === 'blog' ? 10 : s.evidenceLevel === 'image' ? 15 : 0,
+    fit: s.productFit === 'exact' ? 20 : s.productFit === 'adjacent' ? 10 : 0,
+    oem: s.oemSignal === 'oem' ? 15 : s.oemSignal === 'retail' ? 5 : 0,
+    contact: s.contactType === 'named' ? 15 : s.contactType === 'generic' ? 7 : 0,
+    size: s.siteStale ? 3 : (s.sizeBand === 'mid' ? 10 : s.sizeBand === 'edge' ? 7 : 0),
+    completeness: s.contactComplete === 'full' ? 5 : s.contactComplete === 'email_only' ? 3 : 0
+  };
+  var total = parts.evidence + parts.fit + parts.oem + parts.contact + parts.size + parts.completeness;
+  return { total: total, parts: parts, needsHumanCheck: s.evidenceLevel === 'image' };
+}
+// 分档：≥80 优先 / 60-79 可跟 / 40-59 备选 / <40 淘汰。
+function scoreBand(total) {
+  if (total >= SCORE_PRIORITY_MIN) return '优先';
+  if (total >= SCORE_REVIEW_MIN) return '可跟';
+  if (total >= SCORE_DISCARD_MAX) return '备选';
+  return '淘汰';
+}
+// 定档：≥60 待复核 / 40-59 已保留（备选，留池不占待办）/ <40 已淘汰（记原因）。
+function classifyProspect(total, discardReason) {
+  if (total < SCORE_DISCARD_MAX) {
+    return { status: '已淘汰', reason: (discardReason || '分数低于 ' + SCORE_DISCARD_MAX + ' 分（证据/匹配不足）') };
+  }
+  if (total >= SCORE_REVIEW_MIN) return { status: '待复核', reason: '' };
+  return { status: '已保留', reason: '' };
+}
+
+// 搜客池去重：三重检查，对客户档案 + 搜客池（含已淘汰）同时查。
+//   命中任一即跳过，并记原因。免费邮箱域名不算域名去重（几十家公司都用 gmail）。
+//   公司名判重需国家相同（同名不同国家的公司不算同一家；任一国家为空时只按公司名判）。
+// records 是 { email, company, website, country } 的数组；label 是 '客户档案' 或 '搜客池'。
+// 返回 { kind, where, matched }，未命中返回 null。
+function findProspectDuplicate(row, customers, candidates) {
+  var email = normalizeEmail(row.contact_email || row.email || '');
+  var domain = normalizeDomain(row.domain || row.website || '');
+  var emailDom = emailDomain(email);
+  var company = normalizeCompanyName(row.company || '');
+  var country = String(row.country || '').trim().toLowerCase();
+  var recEmail = function (r) { return normalizeEmail(r.email || r.contact_email || ''); };
+  var recDomain = function (r) { return normalizeDomain(r.website || r.domain || ''); };
+  var recEmailDom = function (r) { return emailDomain(recEmail(r)); };
+  var lists = [
+    { rows: customers || [], where: '客户档案' },
+    { rows: candidates || [], where: '搜客池' }
+  ];
+  for (var li = 0; li < lists.length; li++) {
+    var rows = lists[li].rows, where = lists[li].where;
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var display = r.company || r.name || recEmail(r) || recDomain(r) || '';
+      // 1) 邮箱完全相同
+      if (email && recEmail(r) === email) return { kind: '邮箱', where: where, matched: display };
+      // 2) 域名相同：网站域名，或非免费邮箱域名
+      if (domain && recDomain(r) === domain) return { kind: '域名', where: where, matched: display };
+      if (domain && emailDom && !isFreeDomain(emailDom) && recEmailDom(r) === emailDom) {
+        return { kind: '邮箱域名', where: where, matched: display };
+      }
+      if (emailDom && !isFreeDomain(emailDom) && recDomain(r) === emailDom) {
+        return { kind: '邮箱域名', where: where, matched: display };
+      }
+      // 3) 公司名相同且国家相同（任一国家为空时只按公司名判）
+      var rc = normalizeCompanyName(r.company || '');
+      if (company && rc === company) {
+        var rCountry = String(r.country || '').trim().toLowerCase();
+        if (!country || !rCountry || country === rCountry) {
+          return { kind: '公司名', where: where, matched: display };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// 导入列名自动识别：中英文表头同义词（键一律小写后查）。返回 { 字段名: 原表头 }。
+var PROSPECT_COLUMN_MAP = {
+  '公司': 'company', 'company': 'company', '公司名称': 'company', '企业': 'company',
+  '域名': 'domain', 'domain': 'domain', '网址': 'domain', '网站': 'domain', 'website': 'domain',
+  '官网': 'website', '官网地址': 'website',
+  '国家': 'country', '国家/地区': 'country', 'country': 'country',
+  '规模': 'size_text', '员工数': 'size_text', '人数': 'size_text', 'size': 'size_text', 'employees': 'size_text',
+  '邮箱': 'email', 'email': 'email', '邮件': 'email',
+  '联系人': 'contact_name', 'contact': 'contact_name', '姓名': 'contact_name', 'name': 'contact_name',
+  '职位': 'contact_role', 'title': 'contact_role', '职务': 'contact_role', 'role': 'contact_role',
+  '电话': 'phone', '手机': 'phone', 'phone': 'phone', 'tel': 'phone',
+  'whatsapp': 'whatsapp',
+  '证据链接': 'evidence_url', '证据': 'evidence_url', 'evidence': 'evidence_url', '链接': 'evidence_url', 'url': 'evidence_url',
+  '证据摘录': 'evidence_excerpt', '证据摘要': 'evidence_excerpt', '摘录': 'evidence_excerpt', 'excerpt': 'evidence_excerpt',
+  '证据位置': 'evidence_level', '证据类型': 'evidence_level', 'evidence_level': 'evidence_level',
+  '产品类别': 'product_category', '产品': 'product_category', 'category': 'product_category', 'product': 'product_category', '品类': 'product_category',
+  '行业': 'industry', 'industry': 'industry',
+  '定制信号': 'oem_text', 'oem': 'oem_text', '定制': 'oem_text',
+  '活跃': 'activity_text', '最近更新': 'activity_text', '更新': 'activity_text'
+};
+function detectProspectColumns(headers) {
+  var map = {};
+  (headers || []).forEach(function (h) {
+    var key = String(h || '').trim().toLowerCase();
+    var f = PROSPECT_COLUMN_MAP[key];
+    if (f && !map[f]) map[f] = String(h).trim();
+  });
+  return map;
+}
+// 把一行原始导入行按识别出的列映射转成规范字段。
+// 证据位置列的值可能是中文（官网在售/产品页/博客/图片），统一转成内部取值。
+function normalizeProspectRow(raw, mapping) {
+  var o = {};
+  Object.keys(mapping || {}).forEach(function (f) {
+    var h = mapping[f];
+    var v = raw ? raw[h] : '';
+    o[f] = (v === null || v === undefined) ? '' : String(v).trim();
+  });
+  var lv = String(o.evidence_level || '').toLowerCase();
+  o.evidence_level = (lv.indexOf('在售') !== -1 || lv === 'site_sale' || lv === 'site') ? 'site_sale'
+    : (lv.indexOf('产品页') !== -1 || lv === 'product_page' || lv === 'product') ? 'product_page'
+    : (lv.indexOf('博客') !== -1 || lv.indexOf('新闻') !== -1 || lv === 'blog' || lv === 'news') ? 'blog'
+    : (lv.indexOf('图片') !== -1 || lv.indexOf('质感') !== -1 || lv === 'image') ? 'image' : '';
+  o.contact_email = o.email || '';
+  o.domain = normalizeDomain(o.domain || o.website || '');
+  return o;
+}
+// 把规范行拼成直接写 prospect_candidates 的记录（不含 id / batch_id，写库时再补）。
+function buildProspectCandidate(row, signals, scored, status) {
+  var size = parseProspectSize(row.size_text, row.size_min, row.size_max);
+  return {
+    company: row.company || '', domain: normalizeDomain(row.domain || row.website || ''),
+    website: row.website || (row.domain ? 'https://' + normalizeDomain(row.domain) : ''),
+    country: row.country || '', size_min: size ? size.min : null, size_max: size ? size.max : null,
+    size_text: row.size_text || '', evidence_url: row.evidence_url || '',
+    evidence_excerpt: row.evidence_excerpt || '', evidence_level: signals.evidenceLevel || '',
+    product_category: row.product_category || '', product_line: signals.productLine || '',
+    industry: row.industry || '', oem_signal: signals.oemSignal || '', contact_type: signals.contactType || '',
+    score_total: scored.total, score_evidence: scored.parts.evidence, score_fit: scored.parts.fit,
+    score_oem: scored.parts.oem, score_contact: scored.parts.contact, score_size: scored.parts.size,
+    score_completeness: scored.parts.completeness, needs_human_check: scored.needsHumanCheck,
+    status: status, discard_reason: '', verification_status: 'unverified',
+    contact_name: row.contact_name || '', contact_role: row.contact_role || '',
+    contact_email: normalizeEmail(row.contact_email || row.email || ''),
+    contact_phone: row.phone || '', contact_whatsapp: row.whatsapp || ''
+  };
+}
+// 一批导入行的清洗结果（纯函数，不碰 DOM/网络）：
+//   每行依次：硬规则 → 去重（客户档案 + 搜客池含已淘汰 + 本批已入池的）→ 打分 → 定档。
+// 返回 { pooled: [候选记录...], rejected: [{ row, reason }], skipped: [{ row, reason }] }。
+// 被淘汰 / 跳过的行只记原因，不写库、不再重复打分；其中 <40 分的淘汰原因里带分数。
+function processProspectImport(rows, customers, candidates) {
+  var pooled = [], rejected = [], skipped = [];
+  var batchSeen = [];
+  (rows || []).forEach(function (raw) {
+    var row = raw; // 调用方已用 normalizeProspectRow 规范过
+    if (!String(row.company || '').trim() && !row.domain) {
+      rejected.push({ row: row, reason: '无公司名也无域名' });
+      return;
+    }
+    var hard = checkProspectHardRules(row);
+    if (!hard.ok) { rejected.push({ row: row, reason: hard.reason }); return; }
+    var dup = findProspectDuplicate(row, customers, candidates);
+    if (!dup) {
+      var dupInBatch = findProspectDuplicate(row, batchSeen, []);
+      if (dupInBatch) dup = { kind: dupInBatch.kind, where: '本批', matched: dupInBatch.matched };
+    }
+    if (dup) {
+      skipped.push({ row: row, reason: dup.kind + '已存在于' + dup.where + '：' + dup.matched });
+      return;
+    }
+    var signals = detectProspectSignals(row);
+    var scored = scoreProspect(signals);
+    var cls = classifyProspect(scored.total, '');
+    if (cls.status === '已淘汰') {
+      rejected.push({ row: row, reason: cls.reason + '（' + scored.total + ' 分）' });
+      return;
+    }
+    pooled.push(buildProspectCandidate(row, signals, scored, cls.status));
+    batchSeen.push(row);
+  });
+  return { pooled: pooled, rejected: rejected, skipped: skipped };
+}
+// 覆盖记忆判重（纯函数）：同一国家+关键词组之前搜过就返回那条记录（只提示，不拦截）。
+function findProspectCoverageHit(country, keywordGroup, coverageRows) {
+  var c = String(country || '').trim().toLowerCase();
+  var k = String(keywordGroup || '').trim().toLowerCase();
+  if (!c && !k) return null;
+  for (var i = 0; i < (coverageRows || []).length; i++) {
+    var r = coverageRows[i];
+    if (String(r.country || '').trim().toLowerCase() === c &&
+        String(r.keyword_group || '').trim().toLowerCase() === k) return r;
+  }
+  return null;
+}
 
 // 计算一条询盘的跟进桶（返回 key）。
 // 优先级：终态阶段（已成交/已关闭/暂缓）> 下次跟进日期 > 库里显式状态 > 距最后联系天数。
@@ -595,6 +939,8 @@ function renderCards() {
   $('allCount').textContent = state.inquiries.length || '';
   $('orderCount').textContent = state.orders.length || '';
   $('supplierCount').textContent = state.suppliers.length || '';
+  var pc = $('prospectCount');
+  if (pc) pc.textContent = state.prospects.length || '';
   // 空态：未导入真实数据时显示导入提示条
   var empty = state.customers.length === 0 && state.inquiries.length === 0;
   $('importBanner').classList.toggle('hidden', !empty);
@@ -1476,6 +1822,396 @@ function renderAll() {
   renderOrders();
   renderSuppliers();
   renderSummary();
+  renderProspects();
+}
+
+// ---------- 搜客池 Phase 1：列表 / 导入 / 转客户 ----------
+// 列表按分数倒序；筛选：国家 / 分数段 / 状态 / 批次 + 搜索（公司、域名、联系人）。
+// 版式按客户档案的宽松表格来，不做密表。
+function prospectBandClass(band) {
+  return band === '优先' ? 'band-hot' : band === '可跟' ? 'band-mid' : band === '备选' ? 'band-low' : 'band-out';
+}
+function filteredProspects() {
+  var rows = state.prospects.slice();
+  if (prospectCountryFilter) rows = rows.filter(function (c) { return String(c.country || '') === prospectCountryFilter; });
+  if (prospectBandFilter) rows = rows.filter(function (c) { return scoreBand(c.score_total || 0) === prospectBandFilter; });
+  if (prospectStatusFilter) rows = rows.filter(function (c) { return String(c.status || '') === prospectStatusFilter; });
+  if (prospectBatchFilter) rows = rows.filter(function (c) { return String(c.batch_id || '') === prospectBatchFilter; });
+  if (prospectSearchText) {
+    var q = prospectSearchText.toLowerCase();
+    rows = rows.filter(function (c) {
+      return ((c.company || '') + ' ' + (c.domain || '') + ' ' + (c.contact_name || '') + ' ' + (c.contact_email || '')).toLowerCase().indexOf(q) !== -1;
+    });
+  }
+  rows.sort(function (a, b) {
+    var d = (b.score_total || 0) - (a.score_total || 0);
+    if (d) return d;
+    return String(a.company || '').localeCompare(String(b.company || ''), 'zh-CN');
+  });
+  return rows;
+}
+// 国家 / 批次下拉由数据里实际出现的值生成；数据不变时不重建（不丢当前选择）。
+function syncProspectFilterOptions() {
+  var countrySel = $('filterProspectCountry'), batchSel = $('filterProspectBatch');
+  if (!countrySel || !batchSel) return;
+  var countries = [], seenC = {};
+  state.prospects.forEach(function (c) {
+    var v = String(c.country || '').trim();
+    if (v && !seenC[v]) { seenC[v] = true; countries.push(v); }
+  });
+  countries.sort(function (a, b) { return a.localeCompare(b, 'zh-CN'); });
+  var batches = state.prospectBatches.slice();
+  var sig = countries.join('|') + '#' + batches.map(function (b) { return b.id; }).join('|');
+  if (sig === prospectFilterSig) return;
+  prospectFilterSig = sig;
+  var curC = countrySel.value, curB = batchSel.value;
+  countrySel.innerHTML = '<option value="">全部国家</option>' +
+    countries.map(function (c) { return '<option value="' + esc(c) + '">' + esc(c) + '</option>'; }).join('');
+  batchSel.innerHTML = '<option value="">全部批次</option>' +
+    batches.map(function (b) {
+      var label = fmtDate(b.run_at || b.created_at) + ' · ' + (b.country || '多国') + ' ' + (b.keyword_group || '') + '（入池 ' + (b.pooled_count || 0) + '）';
+      return '<option value="' + esc(b.id) + '">' + esc(label) + '</option>';
+    }).join('');
+  if (curC && seenC[curC]) countrySel.value = curC;
+  if (curB && batches.some(function (b) { return String(b.id) === curB; })) batchSel.value = curB;
+}
+
+function prospectRowHtml(c) {
+  var band = scoreBand(c.score_total || 0);
+  var evUrl = c.evidence_url || (c.website || '');
+  var evLink = evUrl ? '<a href="' + esc(evUrl) + '" target="_blank" rel="noopener">证据链接 ↗</a>' : '<span class="c-sub">—</span>';
+  var excerpt = c.evidence_excerpt ? '<div class="ev-excerpt">' + esc(String(c.evidence_excerpt).slice(0, 120)) + '</div>' : '';
+  var statusHtml = '<span class="badge ' +
+    (c.status === '已转客户' ? 'done' : c.status === '已淘汰' ? 'pending' : c.status === '已保留' ? 'waiting' : 'review') +
+    '">' + esc(c.status || '待复核') + '</span>';
+  if (c.status === '已淘汰' && c.discard_reason) statusHtml += '<div class="c-sub">' + esc(c.discard_reason) + '</div>';
+  if (c.status === '已转客户') statusHtml += '<div class="c-sub">已转入客户档案</div>';
+  if (c.needs_human_check) statusHtml += '<div class="c-sub">图片质感判断，需人工复核</div>';
+  var canConvert = (c.status === '待复核' || c.status === '已保留') && !!String(c.contact_email || '').trim();
+  var actions = '';
+  if (canConvert) actions += '<button class="small" data-convert-prospect="' + esc(c.id) + '">转客户</button>';
+  else if (c.status === '待复核' || c.status === '已保留') actions += '<button class="small" disabled title="没有邮箱，无法转客户（先补一个决策人邮箱）">转客户</button>';
+  if (c.status === '待复核' || c.status === '已保留') {
+    actions += '<button class="small ghost" data-discard-prospect="' + esc(c.id) + '">淘汰</button>';
+  }
+  return '<tr>' +
+    '<td><div class="c-name">' + esc(c.company || '未知公司') + '</div>' +
+    (c.domain ? '<div class="c-sub"><a href="' + esc(c.website || ('https://' + c.domain)) + '" target="_blank" rel="noopener">' + esc(c.domain) + ' ↗</a></div>' : '') +
+    (c.contact_name || c.contact_email ? '<div class="c-sub">' + esc(c.contact_name || '') + (c.contact_role ? ' · ' + esc(c.contact_role) : '') + (c.contact_email ? ' · ' + esc(c.contact_email) : '') + '</div>' : '') +
+    '</td>' +
+    '<td><div>' + esc(c.country || '—') + '</div>' +
+    '<div class="c-sub">' + esc(c.size_text || (c.size_min != null ? c.size_min + (c.size_max && c.size_max !== c.size_min ? '-' + c.size_max : '') + ' 人' : '规模未提供')) + '</div>' +
+    '<div class="c-sub">' + esc(c.product_category || '') + (c.product_line ? ' · ' + esc(c.product_line) : '') + '</div></td>' +
+    '<td><div class="score-num">' + (c.score_total == null ? '—' : c.score_total) + '</div>' +
+    '<span class="badge ' + prospectBandClass(band) + '">' + band + '</span>' +
+    '<div class="score-sub">证据 ' + (c.score_evidence || 0) + ' · 匹配 ' + (c.score_fit || 0) + ' · 定制 ' + (c.score_oem || 0) + '<br>联系 ' + (c.score_contact || 0) + ' · 规模 ' + (c.score_size || 0) + ' · 完整 ' + (c.score_completeness || 0) + '</div></td>' +
+    '<td>' + evLink + excerpt + '</td>' +
+    '<td>' + statusHtml + '</td>' +
+    '<td><div class="row-actions">' + actions + '</div></td></tr>';
+}
+
+function renderProspects() {
+  var batchEl = $('prospectBatchList'), listEl = $('prospectList');
+  if (!batchEl || !listEl) return;
+  syncProspectFilterOptions();
+  var pill = $('prospectCountPill');
+  if (pill) pill.textContent = state.prospects.length;
+  // 批次：时间 / 国家 / 关键词组 / 来源 / 原始-淘汰-入池三数
+  if (!state.prospectBatches.length) {
+    batchEl.innerHTML = '<div class="empty">还没有导入过名单。上面选好国家、关键词组和来源，导入一个 Excel 名单就能看到批次。</div>';
+  } else {
+    var bh = '<table class="follow-table"><thead><tr><th>批次时间</th><th>国家</th><th>关键词组</th><th>来源</th><th>原始</th><th>淘汰</th><th>入池</th><th>备注</th></tr></thead><tbody>';
+    state.prospectBatches.forEach(function (b) {
+      bh += '<tr><td>' + esc(fmtDate(b.run_at || b.created_at)) + '</td><td>' + esc(b.country || '—') + '</td>' +
+        '<td>' + esc(b.keyword_group || '—') + '</td><td>' + esc(b.source || '') + '</td>' +
+        '<td>' + (b.raw_count || 0) + '</td><td>' + (b.discarded_count || 0) + '</td><td>' + (b.pooled_count || 0) + '</td>' +
+        '<td class="c-sub">' + esc(b.note || '') + '</td></tr>';
+    });
+    batchEl.innerHTML = bh + '</tbody></table>';
+  }
+  var rows = filteredProspects();
+  var countEl = $('prospectListCount');
+  if (countEl) countEl.textContent = '（' + rows.length + ' 条）';
+  if (!rows.length) {
+    listEl.innerHTML = '<div class="empty">这个筛选下暂无候选。' +
+      (state.prospects.length === 0 ? '请先导入一个 Excel 名单（支持 .xlsx / .csv，第一行为表头）。' : '试试换个搜索词或筛选条件。') + '</div>';
+    return;
+  }
+  var html = '<table class="cust-table"><thead><tr><th>公司 / 联系人</th><th>国家 · 规模 · 产品</th><th>分数</th><th>证据</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+  rows.forEach(function (c) { html += prospectRowHtml(c); });
+  html += '</tbody></table>';
+  listEl.innerHTML = html;
+}
+
+// 搜客池页的状态行（导入/转客户/淘汰的反馈，写在表格上方，不动顶部的全局状态行）。
+function setProspectStatus(msg, isError) {
+  var el = $('prospectStatus');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle('error', !!isError);
+}
+function newUuid() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+    var r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+// ---------- 搜客池：导入 Excel 名单 ----------
+// 流程：读文件（第一张表）→ 自动识别列名 → 预览（映射 + 行数 + 前 5 行的预计结果）→
+//   点“确认导入”才写库。导入本身只在跟进系统里清洗/去重/打分，不连任何外部服务。
+function handleProspectFile(file) {
+  if (!file) return;
+  var name = String(file.name || '').toLowerCase();
+  var meta = {
+    country: ($('prospectBatchCountry') ? $('prospectBatchCountry').value.trim() : ''),
+    keywordGroup: ($('prospectBatchKeywords') ? $('prospectBatchKeywords').value.trim() : ''),
+    source: ($('prospectBatchSource') ? $('prospectBatchSource').value : '手工导入')
+  };
+  var done = function (rawRows) {
+    if (!rawRows || !rawRows.length) { setProspectStatus('文件里没有数据行（第一行为表头）。', true); return; }
+    var headers = Object.keys(rawRows[0] || {});
+    var mapping = detectProspectColumns(headers);
+    if (!mapping.company && !mapping.domain) {
+      setProspectStatus('没识别出公司/域名列：请确认第一行是表头，且包含“公司”“域名”或“官网”列。已识别的列：' + (Object.keys(mapping).join('、') || '无'), true);
+      return;
+    }
+    var rows = rawRows.map(function (r) { return normalizeProspectRow(r, mapping); });
+    var result = processProspectImport(rows, state.customers, state.prospects);
+    pendingProspectImport = { rows: rows, mapping: mapping, meta: meta, result: result, fileName: file.name };
+    renderProspectImportPreview();
+  };
+  setProspectStatus('正在读取 ' + file.name + '……');
+  if (name.endsWith('.csv')) {
+    file.text().then(function (txt) { done(parseCsvText(txt)); })
+      .catch(function (e) { setProspectStatus('读取文件失败：' + e.message, true); });
+  } else if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+    var readXlsx = function (XLSX) {
+      return file.arrayBuffer().then(function (buf) {
+        var wb = XLSX.read(buf, { type: 'array' });
+        var ws = wb.Sheets[wb.SheetNames[0]];
+        done(XLSX.utils.sheet_to_json(ws, { defval: '' }));
+      });
+    };
+    if (typeof window !== 'undefined' && window.XLSX) readXlsx(window.XLSX)
+      .catch(function (e) { setProspectStatus('读取文件失败：' + e.message, true); });
+    else loadSheetJS().then(readXlsx)
+      .catch(function (e) { setProspectStatus('导入失败：表格组件未能加载（' + e.message + '），可以先把文件另存为 .csv 再导入。', true); });
+  } else {
+    setProspectStatus('只支持 .xlsx / .csv 文件。', true);
+  }
+  var fi = $('importProspectFile');
+  if (fi) fi.value = ''; // 允许下次再选同一个文件
+}
+// 导入预览：识别出的列映射 + 行数 + 前 5 行的预计结果（入池/淘汰/跳过 + 分数），确认后才写库。
+function renderProspectImportPreview() {
+  var el = $('prospectImportPreview');
+  if (!el) return;
+  if (!pendingProspectImport) { el.innerHTML = ''; return; }
+  var p = pendingProspectImport;
+  var r = p.result;
+  var mapLines = Object.keys(p.mapping).map(function (f) { return esc(f) + ' ← ' + esc(p.mapping[f]); }).join('；');
+  var covHit = findProspectCoverageHit(p.meta.country, p.meta.keywordGroup, state.prospectCoverage);
+  var covNote = covHit ? '<div class="c-sub">提示：' + esc(p.meta.country || '该国家') + ' + ' + esc(p.meta.keywordGroup || '该关键词组') + ' 之前已搜过（' + esc(fmtDate(covHit.searched_at)) + '，已见 ' + (covHit.domains_seen || []).length + ' 个域名），本批仍会导入，但去重会跳过已见过的公司。</div>' : '';
+  var previewRows = p.rows.slice(0, 5).map(function (row) {
+    var hard = checkProspectHardRules(row);
+    var outcome, scoreTxt = '—';
+    if (!hard.ok) outcome = '淘汰：' + hard.reason;
+    else {
+      var dup = findProspectDuplicate(row, state.customers, state.prospects);
+      if (dup) outcome = '跳过：' + dup.kind + '已存在于' + dup.where;
+      else {
+        var sc = scoreProspect(detectProspectSignals(row));
+        scoreTxt = String(sc.total);
+        outcome = scoreBand(sc.total) + '（' + classifyProspect(sc.total, '').status + '）';
+      }
+    }
+    return '<tr><td>' + esc(row.company || '') + '</td><td>' + esc(row.domain || '') + '</td><td>' + esc(row.country || '') + '</td><td>' + scoreTxt + '</td><td>' + esc(outcome) + '</td></tr>';
+  }).join('');
+  el.innerHTML = '<div class="review-card"><div class="r-subject">导入预览：' + esc(p.fileName) + '</div>' +
+    '<div class="r-meta">识别出的列：' + mapLines + '</div>' +
+    '<div class="r-meta">国家：' + esc(p.meta.country || '（按行取）') + ' · 关键词组：' + esc(p.meta.keywordGroup || '（未填）') + ' · 来源：' + esc(p.meta.source) + '</div>' +
+    '<div>总行数 ' + p.rows.length + ' 行 → 预计入池 ' + r.pooled.length + ' 条，淘汰 ' + r.rejected.length + ' 条，去重跳过 ' + r.skipped.length + ' 条。</div>' +
+    covNote +
+    '<table class="follow-table" style="margin-top:10px"><thead><tr><th>公司</th><th>域名</th><th>国家</th><th>分数</th><th>预计结果</th></tr></thead><tbody>' + previewRows + '</tbody></table>' +
+    '<div class="row-actions"><button class="small" data-confirm-prospect-import>确认导入</button>' +
+    '<button class="small ghost" data-cancel-prospect-import>取消</button></div></div>';
+  setProspectStatus('预览已生成：总 ' + p.rows.length + ' 行，预计入池 ' + r.pooled.length + ' 条，淘汰 ' + r.rejected.length + ' 条，去重跳过 ' + r.skipped.length + ' 条。核对无误再点“确认导入”。');
+}
+// 确认导入：先写批次，再批量写候选（自带 UUID，联系人直接关联），最后更新覆盖记忆。
+function confirmProspectImport() {
+  var p = pendingProspectImport;
+  if (!p) return;
+  if (!hasKey) { alert('未配置 Supabase key，无法导入'); return; }
+  var r = p.result;
+  var batchId = newUuid();
+  var now = new Date().toISOString();
+  setProspectStatus('正在导入 ' + r.pooled.length + ' 条候选……');
+  var discardReasons = {};
+  r.rejected.forEach(function (x) { var k = String(x.reason).split('：')[0]; discardReasons[k] = (discardReasons[k] || 0) + 1; });
+  var skipReasons = {};
+  r.skipped.forEach(function (x) { var k = String(x.reason).split('：')[0]; skipReasons[k] = (skipReasons[k] || 0) + 1; });
+  var noteParts = [];
+  Object.keys(discardReasons).forEach(function (k) { noteParts.push('淘汰 ' + k + ' ' + discardReasons[k] + ' 条'); });
+  Object.keys(skipReasons).forEach(function (k) { noteParts.push('去重跳过 ' + k + ' ' + skipReasons[k] + ' 条'); });
+  var batch = {
+    id: batchId, country: p.meta.country || '', keyword_group: p.meta.keywordGroup || '',
+    source: p.meta.source || '手工导入', run_at: now,
+    raw_count: p.rows.length, discarded_count: r.rejected.length + r.skipped.length,
+    pooled_count: r.pooled.length, note: noteParts.join('；')
+  };
+  sbInsert('prospect_batches', batch).then(function () {
+    var candidates = r.pooled.map(function (c) {
+      var row = Object.assign({}, c, { id: newUuid(), batch_id: batchId });
+      return row;
+    });
+    var insertCandidates = candidates.length
+      ? sb('prospect_candidates', { method: 'POST', body: candidates }).catch(function () {
+          // 整批失败再逐条插（与客户导入同一做法），逐条失败的计入失败数
+          var chain = Promise.resolve();
+          var okRows = [];
+          candidates.forEach(function (row) {
+            chain = chain.then(function () {
+              return sbInsert('prospect_candidates', row).then(function (ins) { if (ins && ins[0]) okRows.push(ins[0]); }).catch(function () { /* 失败的跳过 */ });
+            });
+          });
+          return chain.then(function () { return okRows; });
+        })
+      : Promise.resolve([]);
+    return insertCandidates.then(function (inserted) {
+      var byDomain = {};
+      (Array.isArray(inserted) ? inserted : []).forEach(function (c) { if (c && c.domain) byDomain[normalizeDomain(c.domain)] = c; });
+      candidates.forEach(function (c) { if (!byDomain[c.domain]) byDomain[c.domain] = c; });
+      // 联系人：主联系人有邮箱/姓名才建一条（决策人优先标记）；无联系信息的候选不建空行
+      var contacts = [];
+      r.pooled.forEach(function (cand) {
+        var saved = byDomain[cand.domain];
+        if (!saved) return;
+        if (cand.contact_email || cand.contact_name) {
+          contacts.push({
+            candidate_id: saved.id, name: cand.contact_name || '', role: cand.contact_role || '',
+            email: cand.contact_email || '', phone: cand.contact_phone || '',
+            verification_status: 'unverified', source: p.meta.source || '手工导入',
+            is_decision_maker: cand.contact_type === 'named'
+          });
+        }
+      });
+      var insertContacts = contacts.length
+        ? sb('prospect_contacts', { method: 'POST', body: contacts }).catch(function () { return []; })
+        : Promise.resolve([]);
+      return insertContacts.then(function () {
+        // 覆盖记忆：同一国家+关键词组只留一条，域名并集；只提示、不拦截
+        var domains = candidates.map(function (c) { return c.domain; }).filter(function (d) { return !!d; });
+        var hit = findProspectCoverageHit(p.meta.country, p.meta.keywordGroup, state.prospectCoverage);
+        if (hit) {
+          var merged = (hit.domains_seen || []).slice();
+          domains.forEach(function (d) { if (merged.indexOf(d) === -1) merged.push(d); });
+          return sbUpdate('prospect_coverage', hit.id, { domains_seen: merged, searched_at: now, updated_at: now });
+        }
+        if (p.meta.country || p.meta.keywordGroup) {
+          return sbInsert('prospect_coverage', {
+            country: p.meta.country || '', keyword_group: p.meta.keywordGroup || '',
+            source: p.meta.source || '手工导入', domains_seen: domains, searched_at: now
+          });
+        }
+        return null;
+      });
+    });
+  }).then(function () {
+    pendingProspectImport = null;
+    renderProspectImportPreview();
+    setProspectStatus('导入完成：原始 ' + batch.raw_count + ' 行，入池 ' + batch.pooled_count + ' 条，淘汰/跳过 ' + batch.discarded_count + ' 条。' + (batch.note ? '（' + batch.note + '）' : ''));
+    loadAll();
+  }).catch(function (e) {
+    setProspectStatus('导入失败：' + e.message, true);
+  });
+}
+
+// 转客户：复用现有去重（撞上已有客户直接提示是哪一位，不重复建）、
+//   标签约定（产品｜行业｜年月）+ 转入后第一条待办 +3 天。
+// 转入时建一条新询盘（新询盘 / 未回复·等待客户 / 下次跟进 +3 天）；
+//   候选状态改为 已转客户，并记下转成的客户/询盘 id。
+function convertProspectToCustomer(candidateId) {
+  var cand = null;
+  state.prospects.forEach(function (c) { if (String(c.id) === String(candidateId)) cand = c; });
+  if (!cand) return;
+  if (!cand.contact_email) { alert('该候选没有邮箱，无法转客户（先补一个决策人邮箱）。'); return; }
+  if (!hasKey) { alert('未配置 Supabase key，无法保存'); return; }
+  var dup = findDuplicateCustomer(state.customers, cand.contact_email, cand.company);
+  if (dup) {
+    alert('已存在相同客户，不重复创建：' + (dup.company || dup.name || '') + '（' + (dup.email || '') + '）\n' +
+      '命中原因：邮箱相同，或同一家公司用了同一个企业邮箱域名。\n' +
+      '请在客户档案里找到这位客户继续跟进。');
+    return;
+  }
+  var today = todayStr();
+  var due = addDays(today, FOLLOWUP_DELAY_DAYS);
+  var product = cand.product_category || '潜水料';
+  // 标签：产品｜行业｜年月（只有已知的段才拼，不编造行业）；另加一个“搜客池”来源标签。
+  var tagParts = [product];
+  if (String(cand.industry || '').trim()) tagParts.push(String(cand.industry).trim());
+  tagParts.push(today.slice(0, 7));
+  var tags = [tagParts.join('｜'), '搜客池'];
+  var customer = {
+    name: cand.contact_name || cand.company || '', company: cand.company || '',
+    email: normalizeEmail(cand.contact_email), country: cand.country || '',
+    website: cand.website || '', phone: cand.contact_phone || '',
+    whatsapp: cand.contact_whatsapp || '', stage: '待评估',
+    verification_status: cand.verification_status || 'unverified',
+    tags: tags, outreach_count: 0, read_count: 0, health_score: 50,
+    last_contact_at: null, next_followup_at: due,
+    next_action: '搜客池转入：跟进' + product + '的询盘',
+    source: '搜客池',
+    notes: '搜客池转入；证据：' + (cand.evidence_url || cand.website || '')
+  };
+  setProspectStatus('正在转客户：' + (cand.company || '') + '……');
+  sbInsert('followup_customers', customer).then(function (inserted) {
+    var fresh = inserted && inserted[0] ? inserted[0] : customer;
+    state.customers.unshift(fresh);
+    var inquiry = {
+      customer_id: fresh.id, product: product, quantity: '',
+      summary: '', status: '待处理', stage: '新询盘', reply_status: '未回复 · 等待客户',
+      inquiry_date: today, first_inquiry_at: new Date().toISOString(),
+      next_action: customer.next_action, next_followup_at: due, next_followup_confirmed: true
+    };
+    return sbInsert('followup_inquiries', inquiry).then(function (ins2) {
+      var freshInq = ins2 && ins2[0] ? ins2[0] : inquiry;
+      state.inquiries.unshift(freshInq);
+      // 转客户后第一条待办 +3 天（与 FOLLOWUP_DELAY_DAYS 一致）
+      createFollowupTodo(freshInq, customer.next_action, due);
+      return sbUpdate('prospect_candidates', cand.id, {
+        status: '已转客户', converted_customer_id: fresh.id,
+        converted_inquiry_id: freshInq.id || null, updated_at: new Date().toISOString()
+      }).then(function (updated) {
+        var freshCand = updated && updated[0] ? updated[0] : Object.assign({}, cand, { status: '已转客户' });
+        state.prospects = state.prospects.map(function (x) { return String(x.id) === String(cand.id) ? freshCand : x; });
+        setProspectStatus('已转客户：' + (cand.company || '') + '（' + (fresh.email || '') + '），已建询盘与 +3 天待办（到期 ' + due + '）。');
+        renderAll();
+      });
+    });
+  }).catch(function (e) {
+    setProspectStatus('转客户失败：' + e.message, true);
+  });
+}
+
+// 人工淘汰：状态改为 已淘汰并记原因（原因写进 discard_reason，下次再搜到直接跳过）。
+function discardProspect(candidateId) {
+  var cand = null;
+  state.prospects.forEach(function (c) { if (String(c.id) === String(candidateId)) cand = c; });
+  if (!cand) return;
+  if (!hasKey) { alert('未配置 Supabase key，无法保存'); return; }
+  var reason = prompt('淘汰 ' + (cand.company || '') + ' 的原因：', cand.discard_reason || '人工淘汰');
+  if (reason === null) return; // 点了取消
+  reason = String(reason).trim() || '人工淘汰';
+  sbUpdate('prospect_candidates', candidateId, { status: '已淘汰', discard_reason: reason, updated_at: new Date().toISOString() })
+    .then(function (updated) {
+      var fresh = updated && updated[0] ? updated[0] : Object.assign({}, cand, { status: '已淘汰', discard_reason: reason });
+      state.prospects = state.prospects.map(function (x) { return String(x.id) === String(candidateId) ? fresh : x; });
+      setProspectStatus('已淘汰：' + (cand.company || '') + '（' + reason + '）。');
+      renderAll();
+    })
+    .catch(function (e) { setProspectStatus('淘汰失败：' + e.message, true); });
 }
 
 // ---------- 保存 / 人工复核 ----------
@@ -1569,29 +2305,47 @@ function confirmReview(emailId, cardEl) {
 // replyingTo = { inquiryId, emailId }：当前打开回复框的那条询盘/原邮件；
 // 与 editingId 一样是跨 renderAll 保留的模块级状态，发送成功或取消后清掉。
 var replyingTo = null;
+// 回复草稿：点“发送”后先存草稿进确认态（页面内确认，不用浏览器原生 confirm，
+// 原生弹窗会被浏览器自动化自动关掉，之前测试就卡在这里）；确认态/编辑态切换、
+// 发送失败回编辑态时，已填的内容都从这里恢复，不会丢。
+var replyDraft = null;
 
 // 回复框：上面是原邮件（回复哪封就显示哪封），下面是收件人/主题/正文/下次跟进。
 // 只发给当前这一个客户，不做群发；收件人默认是原邮件发件人（或客户档案邮箱），
 // 服务端还会再核对一次，不在往来邮箱里的收件人会被拒绝。
 function replyBoxHtml(inq, email) {
   var cust = customerById(inq.customer_id) || {};
-  var to = email ? (email.from_email || '') : (cust.email || '');
-  var subject = email ? ('Re: ' + (email.subject || '')) : ('Re: ' + (inq.product || inq.inquiry_no || ''));
+  var emailId = email ? email.id : '';
+  // 草稿属于这个框（同询盘+同邮件）时，编辑态用草稿回填，确认态直接显示确认面板。
+  var draft = (replyDraft && String(replyDraft.inquiryId) === String(inq.id) && String(replyDraft.emailId || '') === String(emailId || '')) ? replyDraft : null;
+  if (draft && draft.confirming) {
+    var confirmText = '收件人：' + draft.to + '\n主题：' + draft.subject + '\n下次跟进：' + (draft.next || '今天 +3 天') + '\n正文：\n' + draft.body;
+    return '<div class="reply-box" data-reply-box data-inquiry="' + esc(inq.id) + '" data-email="' + esc(emailId) + '">' +
+      '<div class="r-orig">' + esc(confirmText) + '</div>' +
+      '<div class="row-actions"><button class="small" data-confirm-send>确认发送</button>' +
+      '<button class="small ghost" data-back-to-edit>返回修改</button>' +
+      '<button class="small ghost" data-cancel-reply>取消</button></div></div>';
+  }
+  var to = draft ? draft.to : (email ? (email.from_email || '') : (cust.email || ''));
+  var subject = draft ? draft.subject : (email ? ('Re: ' + (email.subject || '')) : ('Re: ' + (inq.product || inq.inquiry_no || '')));
+  var body = draft ? draft.body : '';
+  var next = draft ? draft.next : addDays(todayStr(), FOLLOWUP_DELAY_DAYS);
   var orig = email
     ? ('原邮件：' + (email.subject || '（无主题）') + '（' + (email.from_email || '') + '，' + fmtDate(email.sent_at) + '）\n' + (email.body_text || email.snippet || ''))
     : ('最近回复：' + (inq.reply_snippet || '（无）'));
-  return '<div class="reply-box" data-reply-box data-inquiry="' + esc(inq.id) + '" data-email="' + esc(email ? email.id : '') + '">' +
+  return '<div class="reply-box" data-reply-box data-inquiry="' + esc(inq.id) + '" data-email="' + esc(emailId) + '">' +
     '<div class="r-orig">' + esc(orig) + '</div>' +
     '<label class="muted">收件人（只发给这一个客户）</label><input type="text" data-rf="to" value="' + esc(to) + '">' +
     '<label class="muted">主题</label><input type="text" data-rf="subject" value="' + esc(subject) + '">' +
-    '<label class="muted">正文</label><textarea data-rf="body" rows="6" placeholder="写给客户的正文（纯文本）"></textarea>' +
-    '<label class="muted">下次跟进日期（默认今天 +3 天，可改）</label><input type="date" data-rf="next" value="' + esc(addDays(todayStr(), FOLLOWUP_DELAY_DAYS)) + '">' +
+    '<label class="muted">正文</label><textarea data-rf="body" rows="6" placeholder="写给客户的正文（纯文本）">' + esc(body) + '</textarea>' +
+    '<label class="muted">下次跟进日期（默认今天 +3 天，可改）</label><input type="date" data-rf="next" value="' + esc(next) + '">' +
     '<div class="row-actions"><button class="small" data-send-reply>发送</button>' +
     '<button class="small ghost" data-cancel-reply>取消</button></div></div>';
 }
 
-// 发送：先在确认框里把收件人、主题、正文给用户看一遍，点了确认才发；
-// 只在用户点发送时才发，绝不自动发。发完询盘进“等待客户”，下次跟进按框里的日期。
+// 发送分两步，全部在页面里完成，不用浏览器原生 confirm（原生弹窗会被自动化关掉）：
+// 第一步点“发送”：校验后把内容存进草稿进确认态，框里显示收件人/主题/正文/下次跟进；
+// 第二步点“确认发送”才真正发。只在用户点发送时才发，绝不自动发。发完询盘进“等待客户”，下次跟进按框里的日期。
 function sendReply(boxEl) {
   var inquiryId = boxEl.getAttribute('data-inquiry');
   var emailId = boxEl.getAttribute('data-email') || '';
@@ -1600,34 +2354,48 @@ function sendReply(boxEl) {
   var body = boxEl.querySelector('[data-rf="body"]').value;
   var next = boxEl.querySelector('[data-rf="next"]').value || '';
   if (!to || !subject || !body.trim()) { alert('收件人、主题、正文都要填'); return; }
-  var preview = body.trim().slice(0, 200) + (body.trim().length > 200 ? '…' : '');
-  if (!confirm('确认发送这封邮件吗？\n收件人：' + to + '\n主题：' + subject + '\n正文：' + preview + '\n下次跟进：' + (next || '今天 +3 天'))) return;
-  var btn = boxEl.querySelector('[data-send-reply]');
+  replyDraft = { inquiryId: inquiryId, emailId: emailId, to: to, subject: subject, body: body, next: next, confirming: true };
+  renderAll();
+}
+
+// 确认态点“确认发送”：用草稿里的内容调 /api/send-email。
+function doSendReply(boxEl) {
+  var draft = replyDraft;
+  if (!draft) { alert('草稿找不到了，请重新填写再发送'); return; }
+  var inquiryId = draft.inquiryId;
+  var emailId = draft.emailId || '';
+  var btn = boxEl.querySelector('[data-confirm-send]');
   btn.disabled = true;
   btn.textContent = '发送中……';
   fetch('/api/send-email', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ inquiryId: inquiryId, to: to, subject: subject, body: body, nextFollowupAt: next || undefined, emailId: emailId || undefined })
+    body: JSON.stringify({ inquiryId: inquiryId, to: draft.to, subject: draft.subject, body: draft.body, nextFollowupAt: draft.next || undefined, emailId: emailId || undefined })
   }).then(function (res) {
     return res.json().then(function (b) { return { status: res.status, body: b }; });
   }).then(function (r) {
     if (!r.body || !r.body.ok) {
       btn.disabled = false;
-      btn.textContent = '发送';
+      btn.textContent = '确认发送';
       alert('发送失败：' + ((r.body && r.body.error) || ('HTTP ' + r.status)));
+      replyDraft.confirming = false;
+      renderAll();
       return;
     }
     var patch = { reply_status: r.body.reply_status, next_followup_at: r.body.next_followup_at, next_followup_confirmed: true, next_action: '已发邮件，等客户回复' };
     state.inquiries = state.inquiries.map(function (x) { return String(x.id) === String(inquiryId) ? Object.assign({}, x, patch) : x; });
     if (emailId) { state.emails.forEach(function (e) { if (String(e.id) === String(emailId)) e.needs_review = false; }); }
+    var to = draft.to;
+    replyDraft = null;
     replyingTo = null;
     renderAll();
     setStatus('已发送给 ' + to + '，询盘已进“等待客户”，下次跟进 ' + r.body.next_followup_at + (r.body.todoCreated ? '，已建待办。' : '。'));
   }).catch(function (e) {
     btn.disabled = false;
-    btn.textContent = '发送';
+    btn.textContent = '确认发送';
     alert('发送失败：' + e.message);
+    replyDraft.confirming = false;
+    renderAll();
   });
 }
 
@@ -1882,6 +2650,7 @@ function loadAll() {
   if (!hasKey) {
     state.customers = []; state.inquiries = []; state.emails = [];
     state.orders = []; state.suppliers = []; state.history = [];
+    state.prospects = []; state.prospectBatches = []; state.prospectContacts = []; state.prospectCoverage = [];
     setStatus('未配置 Supabase anon key：请复制 config.example.js 为 config.js 并填入真实 key，导入真实数据后这里会显示 216 位客户 / 201 条询盘。');
     renderAll();
     return;
@@ -1896,7 +2665,13 @@ function loadAll() {
     sbList('followup_orders', 'created_at.desc').catch(function (e) { throw new Error('项目与订单：' + e.message); }),
     sbList('followup_suppliers', 'created_at.desc').catch(function (e) { throw new Error('供应商与物流：' + e.message); }),
     // 跟进历史 310 行：经营汇总的“首次进入已成交”按它推导；PostgREST 默认上限 1000 行，一次够
-    sbList('followup_history', 'created_at.desc').catch(function (e) { throw new Error('跟进历史：' + e.message); })
+    sbList('followup_history', 'created_at.desc').catch(function (e) { throw new Error('跟进历史：' + e.message); }),
+    // 搜客池 Phase 1（4 张表；SQL 先行：表不存在时这里会报加载失败，见 supabase-prospect-pool.sql 头注）
+    sbList('prospect_batches', 'created_at.desc').catch(function (e) { throw new Error('搜客批次：' + e.message); }),
+    // 候选按分数倒序（PostgREST 默认上限 1000 行；先看高分，够复核用）
+    sb('prospect_candidates', { query: 'select=*&order=score_total.desc.nullslast,created_at.desc' }).catch(function (e) { throw new Error('搜客池：' + e.message); }),
+    sbList('prospect_contacts', 'created_at.desc').catch(function (e) { throw new Error('候选联系人：' + e.message); }),
+    sbList('prospect_coverage', 'created_at.desc').catch(function (e) { throw new Error('覆盖记忆：' + e.message); })
   ]).then(function (results) {
     state.customers = results[0] || [];
     state.inquiries = results[1] || [];
@@ -1905,6 +2680,10 @@ function loadAll() {
     state.orders = results[4] || [];
     state.suppliers = results[5] || [];
     state.history = results[6] || [];
+    state.prospectBatches = results[7] || [];
+    state.prospects = results[8] || [];
+    state.prospectContacts = results[9] || [];
+    state.prospectCoverage = results[10] || [];
     // 本次会话刚同步过：保留同步结果的完整数字，不被这里的“上次同步”一行盖掉
     // （旧版盖掉后页面上只剩一行，看不到拉取/新增/匹配/待判断的分项数字）。
     if (lastSyncSummaryText) { $('syncStatus').textContent = lastSyncSummaryText; }
@@ -1919,6 +2698,7 @@ function loadAll() {
     setStatus('加载失败：' + e.message + '（请先在 Supabase SQL Editor 执行 supabase-followup.sql 建表，再按 README 第 5 步导入）', true);
     state.customers = []; state.inquiries = []; state.emails = [];
     state.orders = []; state.suppliers = []; state.history = [];
+    state.prospects = []; state.prospectBatches = []; state.prospectContacts = []; state.prospectCoverage = [];
     renderAll();
     $('followList').innerHTML = '<div class="empty error-box">加载失败：' + esc(e.message) + '</div>';
   });
@@ -1980,6 +2760,15 @@ function init() {
   $('importCustomersFile').addEventListener('change', function () { handleImportFile($('importCustomersFile').files[0]); });
   $('exportCustomersBtn').addEventListener('click', exportCustomersExcel);
   $('refreshCustomersBtn').addEventListener('click', loadAll);
+  // 搜客池：搜索 / 国家 / 分数段 / 状态 / 批次筛选 + 导入 + 刷新
+  $('searchProspects').addEventListener('input', function () { prospectSearchText = $('searchProspects').value.trim(); renderProspects(); });
+  $('filterProspectCountry').addEventListener('change', function () { prospectCountryFilter = $('filterProspectCountry').value; renderProspects(); });
+  $('filterProspectBand').addEventListener('change', function () { prospectBandFilter = $('filterProspectBand').value; renderProspects(); });
+  $('filterProspectStatus').addEventListener('change', function () { prospectStatusFilter = $('filterProspectStatus').value; renderProspects(); });
+  $('filterProspectBatch').addEventListener('change', function () { prospectBatchFilter = $('filterProspectBatch').value; renderProspects(); });
+  $('importProspectBtn').addEventListener('click', function () { $('importProspectFile').click(); });
+  $('importProspectFile').addEventListener('change', function () { handleProspectFile($('importProspectFile').files[0]); });
+  $('refreshProspectsBtn').addEventListener('click', loadAll);
   // 表格复选框（事件委托；每点一次重渲染，勾选状态存在 selectedCustomerIds 里，不会丢）
   document.addEventListener('change', function (e) {
     var t = e.target;
@@ -2015,16 +2804,25 @@ function init() {
     }
     if (t.dataset.editInquiry) { editingId = t.dataset.editInquiry; renderAll(); return; }
     if (t.dataset.saveInquiry) { saveInquiry(t.dataset.saveInquiry); return; }
-    if (t.dataset.replyInquiry) { replyingTo = { inquiryId: t.dataset.replyInquiry, emailId: '' }; renderAll(); return; }
+    if (t.dataset.replyInquiry) { replyingTo = { inquiryId: t.dataset.replyInquiry, emailId: '' }; replyDraft = null; renderAll(); return; }
     if (t.dataset.replyEmail) {
       var em = null;
       state.emails.forEach(function (e) { if (String(e.id) === String(t.dataset.replyEmail)) em = e; });
-      if (em && em.inquiry_id) { replyingTo = { inquiryId: em.inquiry_id, emailId: em.id }; renderAll(); }
+      if (em && em.inquiry_id) { replyingTo = { inquiryId: em.inquiry_id, emailId: em.id }; replyDraft = null; renderAll(); }
       else alert('这封邮件没有关联的询盘，无法回复');
       return;
     }
-    if (t.dataset.sendReply) { var box = t.closest('[data-reply-box]'); if (box) sendReply(box); return; }
-    if (t.hasAttribute('data-cancel-reply')) { replyingTo = null; renderAll(); return; }
+    if (t.hasAttribute('data-send-reply')) { var box = t.closest('[data-reply-box]'); if (box) sendReply(box); return; }
+    if (t.hasAttribute('data-confirm-send')) { var box2 = t.closest('[data-reply-box]'); if (box2) doSendReply(box2); return; }
+    if (t.hasAttribute('data-back-to-edit')) { if (replyDraft) replyDraft.confirming = false; renderAll(); return; }
+    if (t.hasAttribute('data-cancel-reply')) { replyingTo = null; replyDraft = null; renderAll(); return; }
+    if (t.dataset.convertProspect) { convertProspectToCustomer(t.dataset.convertProspect); return; }
+    if (t.dataset.discardProspect) { discardProspect(t.dataset.discardProspect); return; }
+    if (t.hasAttribute('data-confirm-prospect-import')) { confirmProspectImport(); return; }
+    if (t.hasAttribute('data-cancel-prospect-import')) {
+      pendingProspectImport = null; renderProspectImportPreview(); setProspectStatus('已取消导入。');
+      return;
+    }
     if (t.dataset.cancelEdit) { editingId = null; renderAll(); return; }
     if (t.dataset.confirmInquiryReview) {
       var card = t.closest('.review-card');
@@ -2081,6 +2879,24 @@ if (typeof module !== 'undefined' && module.exports) {
     computeMonthlySummary: computeMonthlySummary,
     fmtUSD: fmtUSD,
     fmtCNY: fmtCNY,
-    orderProfitCell: orderProfitCell
+    orderProfitCell: orderProfitCell,
+    // 搜客池 Phase 1（单测用）
+    SCORE_PRIORITY_MIN: SCORE_PRIORITY_MIN,
+    SCORE_REVIEW_MIN: SCORE_REVIEW_MIN,
+    SCORE_DISCARD_MAX: SCORE_DISCARD_MAX,
+    normalizeDomain: normalizeDomain,
+    normalizeCompanyName: normalizeCompanyName,
+    parseProspectSize: parseProspectSize,
+    checkProspectHardRules: checkProspectHardRules,
+    detectProspectSignals: detectProspectSignals,
+    scoreProspect: scoreProspect,
+    scoreBand: scoreBand,
+    classifyProspect: classifyProspect,
+    findProspectDuplicate: findProspectDuplicate,
+    detectProspectColumns: detectProspectColumns,
+    normalizeProspectRow: normalizeProspectRow,
+    processProspectImport: processProspectImport,
+    buildProspectCandidate: buildProspectCandidate,
+    findProspectCoverageHit: findProspectCoverageHit
   };
 }
