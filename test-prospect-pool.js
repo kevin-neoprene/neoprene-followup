@@ -58,6 +58,16 @@ var tri = row({
 var hardTri = P.checkProspectHardRules(tri);
 check('(b2) 三铁方向硬淘汰', hardTri.ok === false && /三铁/.test(hardTri.reason), JSON.stringify(hardTri));
 
+// (b2b) 三铁只拦主营（2026-11-21 23:20 用户放宽）：公司名/产品类别/行业里带三铁才淘汰，
+//   证据摘录里顺带提到三铁不拦——西班牙试搜的 Kynay 就是这么放进来的。
+var kynay = row({
+  company: 'Kynay', domain: 'kynay.com', website: 'https://kynay.com', country: '西班牙',
+  evidence_url: 'https://kynay.com/about-us/',
+  evidence_excerpt: 'We started in 2005 as a company specialized in neoprene wetsuits. We manufacture our own brand of wetsuits for surfing, windsurfing, kite surfing, stand up paddle, triathlon, diving, spearfishing.',
+  product_category: '定制潜水服', contact_email: 'kynay@kynay.com'
+});
+check('(b2b) 三铁只拦主营：证据摘录顺带提到三铁不拦', P.checkProspectHardRules(kynay).ok === true, JSON.stringify(P.checkProspectHardRules(kynay)));
+
 // (c) 日本/中国硬淘汰：国家名、域名后缀两道
 var japan = row({
   company: 'Osaka Wetsuits KK', domain: 'osaka-wetsuits.jp', website: 'https://osaka-wetsuits.jp',
