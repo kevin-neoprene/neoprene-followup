@@ -941,9 +941,6 @@ function renderCards() {
   $('supplierCount').textContent = state.suppliers.length || '';
   var pc = $('prospectCount');
   if (pc) pc.textContent = state.prospects.length || '';
-  // 空态：未导入真实数据时显示导入提示条
-  var empty = state.customers.length === 0 && state.inquiries.length === 0;
-  $('importBanner').classList.toggle('hidden', !empty);
 }
 
 function replyBadge(inq) {
