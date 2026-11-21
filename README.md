@@ -12,8 +12,8 @@
 
 | 文件 | 作用 |
 |---|---|
-| `index.html` / `style.css` / `app.js` | 前端单页：4 张状态卡、跟进清单、客户档案、回复待判断、同步邮箱按钮 |
-| `supabase-followup.sql` | 建表 SQL（10 张表），在 Supabase SQL Editor 执行 |
+| `index.html` / `style.css` / `app.js` | 前端单页：4 张状态卡、跟进清单、客户档案、项目与订单、经营汇总、供应商与物流、回复待判断、同步邮箱按钮 |
+| `supabase-followup.sql` | 建表 SQL（12 张表），在 Supabase SQL Editor 执行 |
 | `api/sync-email.js` | Vercel 后台函数：IMAP 只读同步 + 保守自动分类 |
 | `vercel.json` | `cleanUrls`（与工作面板、PI 生成器一致） |
 | `config.example.js` | 前端配置示例，复制为 `config.js` 后填真实 key |
@@ -58,13 +58,37 @@
 
 项目：**neoprene-order-assistant**（https://gplkvdodbfzknyafdttb.supabase.co，复用，不新建；
 免费版已满 2 个项目）。Supabase 控制台 → SQL Editor → 粘贴执行 `supabase-followup.sql`。
-只新增 10 张表，不动现有的 `panel_*` 表：
+只新增 12 张表，不动现有的 `panel_*` 表：
 
 - `followup_customers`（客户档案，邮箱唯一匹配键）
 - `followup_inquiries`（询盘；状态含旧站的“回复待判断”）
 - `followup_emails`（邮件原文，按 Message-ID 去重）
 - `followup_todos`（待办，指纹去重）
 - `followup_sync_state`（同步状态，id=1 单行）
+- `followup_orders` / `followup_suppliers`（2026-11-16 新增，见下）
+
+## 项目与订单 / 经营汇总 / 供应商与物流（2026-11-16 新增）
+
+来源：旧站项目与订单页 45 条、供应商与物流页 10 家（2026-11-16 用户登录旧站后只读抄录，
+`import/old-orders.csv`、`import/old-suppliers.csv`，说明见 `import/old-system-notes.md`）；
+经营汇总的口径见 `import/Neoprene_经营汇总_2026_11月.xlsx` 的“统计口径”表。
+
+- **新表**：`followup_orders`（订单编号唯一；阶段、金额、汇率、成本、利润状态待确认/预计/已核对；
+  与客户只按公司名精确匹配，单名客户如 Abdullah、Marta 匹配不上时 `customer_id` 留空）；
+  `followup_suppliers`（名称唯一；类型只分供应商/物流商；空字段原文就是“待补充”，原样存）。
+  两表与其它 `followup_*` 表一样用 anon 读写 RLS。
+- **新视图**：项目与订单（类型/搜索/客户/阶段筛选，点客户名筛该客户，利润栏待确认不显示成 0）、
+  经营汇总与报表（按月现算：新增询盘、成交客户、销售额、已核对/预计利润、成交率、每日利润柱状图与每日明细）、
+  供应商与物流（搜索 + 类型筛选）。三个视图的数据都由前端实时算出，不写死数字。
+- **导入**：`python3 import/import-orders-suppliers.py`（默认 dry-run，只计数 + 校验；
+  `--live` 才写库，需 `SUPABASE_URL` + `SUPABASE_ANON_KEY`）。干跑已验证：45 条订单、10 家伙伴、
+  0 警告；已确认订单 26 笔；2026-11 复核 11 条询盘 / 3 位成交客户 / 销售额 US$1,178.50 /
+  ¥7,833.99 / 已核对利润 ¥1,563.99（2/2 笔可计算）/ 成交率 0.0%，与旧站 11 月汇总一致。
+- **口径要点**：确认订单 = 阶段含订单确认/采购/已出货/已完成；销售额 = 已确认订单 +
+  其它未取消且已核对利润的项目（每单只计一次）；人民币销售额逐单用该单汇率四舍五入到分再汇总，
+  缺金额或汇率的订单列为待补、不计为 0；成交客户 = 本月已确认订单客户 ∪ 本月首次进入已成交的
+  询盘客户（跟进历史里 content 含“阶段：已成交”的最早一条，UTC +8 小时取北京时间；无此历史时
+  回退到询盘创建日），按客户去重。
 
 ## 2. 前端配置
 
@@ -83,6 +107,23 @@ cp config.example.js config.js
 # Vercel → Add New Project → Import 该仓库 → Deploy
 npm install   # 本地先装一次，确认 imap、mailparser 能装上
 ```
+
+## 在系统内回邮件（2026-11-21）
+
+- 回复框在 回复待判断（询盘卡片 + 邮件卡片）和询盘的编辑跟进行里：上面显示原邮件，
+  下面填收件人 / 主题 / 正文 / 下次跟进日期（默认今天 +3 天，可改）。
+- 点 发送 前会弹出确认框，再显示一次收件人、主题、正文，只在用户点发送时才发，
+  绝不自动发；一次只发给一个客户，不做群发（群发走来发信）。
+- 后端 `api/send-email.js`（Vercel Serverless）：SMTP smtp.yunyou.top:465 SSL，
+  账号密码复用现有的 `IMAP_USER` / `IMAP_PASS` 环境变量（云邮 SMTP 就是登录密码），
+  密码只从环境变量读，绝不写进代码、绝不打日志、绝不返回给前端。依赖 nodemailer。
+- 服务端核对收件人：必须是该询盘客户档案里的邮箱、往来邮件的发件人，或自己的邮箱
+  （自测），否则 400 拒绝。原邮件有 Message-ID 时带 In-Reply-To / References，
+  在 Foxmail 和对方邮箱里落在同一封 thread 里；发件人固定是 kevin@neoprenecustom.com。
+- 发完：询盘 reply_status → `未回复 · 等待客户`，下次跟进按框里的日期，
+  跟进历史记一行 `发邮件`，按 v3 规则建一条待办（指纹 `sync-out|询盘|日期`），
+  原邮件标 needs_review = false。发出的信不直接入库，下次同步时从已发件里拉回
+  来归档，沿用现有规则（只把下次跟进往后推，不往前改）。
 
 ## 4. 邮箱同步（Vercel 环境变量）
 

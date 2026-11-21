@@ -661,7 +661,10 @@ function inquiryRowHtml(r) {
       // v3：写跟进默认同时建待办（默认勾选，到期日 = 下次跟进日期，未填则今天 +3 天）
       '<label class="todo-check"><input type="checkbox" id="editCreateTodo" checked> 同时创建待办（到期 ' + esc(fmtDate(inq.next_followup_at) === '—' ? addDays(todayStr(), DEFAULT_TODO_DAYS) : fmtDate(inq.next_followup_at)) + '）</label>' +
       '<div class="row-actions"><button class="small" data-save-inquiry="' + esc(inq.id) + '">保存</button>' +
-      '<button class="small ghost" data-cancel-edit="1">取消</button></div></td></tr>';
+      '<button class="small ghost" data-reply-inquiry="' + esc(inq.id) + '">回复客户</button>' +
+      '<button class="small ghost" data-cancel-edit="1">取消</button></div>' +
+      (replyingTo && String(replyingTo.inquiryId) === String(inq.id) && !replyingTo.emailId ? replyBoxHtml(inq, null) : '') +
+      '</td></tr>';
   }
   return html;
 }
@@ -1175,7 +1178,10 @@ function renderReview() {
       Object.keys(INTENT_LABELS).map(function (k) {
         return '<option value="' + k + '">' + INTENT_LABELS[k] + '</option>';
       }).join('') + '</select>' +
-      '<button class="small" data-confirm-inquiry-review="' + esc(inq.id) + '">确认并标记已处理</button></div></div>';
+      '<button class="small" data-confirm-inquiry-review="' + esc(inq.id) + '">确认并标记已处理</button>' +
+      '<button class="small ghost" data-reply-inquiry="' + esc(inq.id) + '">回复客户</button></div>' +
+      (replyingTo && String(replyingTo.inquiryId) === String(inq.id) && !replyingTo.emailId ? replyBoxHtml(inq, null) : '') +
+      '</div>';
   });
   pendingEmails.forEach(function (e) {
     var cust = customerById(e.customer_id) || {};
@@ -1190,7 +1196,10 @@ function renderReview() {
         return '<option value="' + k + '"' + (k === e.intent ? ' selected' : '') + '>' + INTENT_LABELS[k] + '</option>';
       }).join('') + '</select>' +
       '<button class="small" data-confirm-review="' + esc(e.id) + '">确认并标记已处理</button>' +
-      '<button class="small ghost" data-toggle-body>查看原文</button></div></div>';
+      '<button class="small ghost" data-toggle-body>查看原文</button>' +
+      '<button class="small ghost" data-reply-email="' + esc(e.id) + '">回复这封邮件</button></div>' +
+      (replyingTo && String(replyingTo.emailId) === String(e.id) && inquiryById(e.inquiry_id) ? replyBoxHtml(inquiryById(e.inquiry_id), e) : '') +
+      '</div>';
   });
   el.innerHTML = html;
 }
@@ -1554,6 +1563,72 @@ function confirmReview(emailId, cardEl) {
       renderAll();
     });
   }).catch(function (e) { alert('保存失败：' + e.message); });
+}
+
+// ---------- 在系统内回邮件 ----------
+// replyingTo = { inquiryId, emailId }：当前打开回复框的那条询盘/原邮件；
+// 与 editingId 一样是跨 renderAll 保留的模块级状态，发送成功或取消后清掉。
+var replyingTo = null;
+
+// 回复框：上面是原邮件（回复哪封就显示哪封），下面是收件人/主题/正文/下次跟进。
+// 只发给当前这一个客户，不做群发；收件人默认是原邮件发件人（或客户档案邮箱），
+// 服务端还会再核对一次，不在往来邮箱里的收件人会被拒绝。
+function replyBoxHtml(inq, email) {
+  var cust = customerById(inq.customer_id) || {};
+  var to = email ? (email.from_email || '') : (cust.email || '');
+  var subject = email ? ('Re: ' + (email.subject || '')) : ('Re: ' + (inq.product || inq.inquiry_no || ''));
+  var orig = email
+    ? ('原邮件：' + (email.subject || '（无主题）') + '（' + (email.from_email || '') + '，' + fmtDate(email.sent_at) + '）\n' + (email.body_text || email.snippet || ''))
+    : ('最近回复：' + (inq.reply_snippet || '（无）'));
+  return '<div class="reply-box" data-reply-box data-inquiry="' + esc(inq.id) + '" data-email="' + esc(email ? email.id : '') + '">' +
+    '<div class="r-orig">' + esc(orig) + '</div>' +
+    '<label class="muted">收件人（只发给这一个客户）</label><input type="text" data-rf="to" value="' + esc(to) + '">' +
+    '<label class="muted">主题</label><input type="text" data-rf="subject" value="' + esc(subject) + '">' +
+    '<label class="muted">正文</label><textarea data-rf="body" rows="6" placeholder="写给客户的正文（纯文本）"></textarea>' +
+    '<label class="muted">下次跟进日期（默认今天 +3 天，可改）</label><input type="date" data-rf="next" value="' + esc(addDays(todayStr(), FOLLOWUP_DELAY_DAYS)) + '">' +
+    '<div class="row-actions"><button class="small" data-send-reply>发送</button>' +
+    '<button class="small ghost" data-cancel-reply>取消</button></div></div>';
+}
+
+// 发送：先在确认框里把收件人、主题、正文给用户看一遍，点了确认才发；
+// 只在用户点发送时才发，绝不自动发。发完询盘进“等待客户”，下次跟进按框里的日期。
+function sendReply(boxEl) {
+  var inquiryId = boxEl.getAttribute('data-inquiry');
+  var emailId = boxEl.getAttribute('data-email') || '';
+  var to = boxEl.querySelector('[data-rf="to"]').value.trim();
+  var subject = boxEl.querySelector('[data-rf="subject"]').value.trim();
+  var body = boxEl.querySelector('[data-rf="body"]').value;
+  var next = boxEl.querySelector('[data-rf="next"]').value || '';
+  if (!to || !subject || !body.trim()) { alert('收件人、主题、正文都要填'); return; }
+  var preview = body.trim().slice(0, 200) + (body.trim().length > 200 ? '…' : '');
+  if (!confirm('确认发送这封邮件吗？\n收件人：' + to + '\n主题：' + subject + '\n正文：' + preview + '\n下次跟进：' + (next || '今天 +3 天'))) return;
+  var btn = boxEl.querySelector('[data-send-reply]');
+  btn.disabled = true;
+  btn.textContent = '发送中……';
+  fetch('/api/send-email', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inquiryId: inquiryId, to: to, subject: subject, body: body, nextFollowupAt: next || undefined, emailId: emailId || undefined })
+  }).then(function (res) {
+    return res.json().then(function (b) { return { status: res.status, body: b }; });
+  }).then(function (r) {
+    if (!r.body || !r.body.ok) {
+      btn.disabled = false;
+      btn.textContent = '发送';
+      alert('发送失败：' + ((r.body && r.body.error) || ('HTTP ' + r.status)));
+      return;
+    }
+    var patch = { reply_status: r.body.reply_status, next_followup_at: r.body.next_followup_at, next_followup_confirmed: true, next_action: '已发邮件，等客户回复' };
+    state.inquiries = state.inquiries.map(function (x) { return String(x.id) === String(inquiryId) ? Object.assign({}, x, patch) : x; });
+    if (emailId) { state.emails.forEach(function (e) { if (String(e.id) === String(emailId)) e.needs_review = false; }); }
+    replyingTo = null;
+    renderAll();
+    setStatus('已发送给 ' + to + '，询盘已进“等待客户”，下次跟进 ' + r.body.next_followup_at + (r.body.todoCreated ? '，已建待办。' : '。'));
+  }).catch(function (e) {
+    btn.disabled = false;
+    btn.textContent = '发送';
+    alert('发送失败：' + e.message);
+  });
 }
 
 function addCustomer() {
@@ -1940,6 +2015,16 @@ function init() {
     }
     if (t.dataset.editInquiry) { editingId = t.dataset.editInquiry; renderAll(); return; }
     if (t.dataset.saveInquiry) { saveInquiry(t.dataset.saveInquiry); return; }
+    if (t.dataset.replyInquiry) { replyingTo = { inquiryId: t.dataset.replyInquiry, emailId: '' }; renderAll(); return; }
+    if (t.dataset.replyEmail) {
+      var em = null;
+      state.emails.forEach(function (e) { if (String(e.id) === String(t.dataset.replyEmail)) em = e; });
+      if (em && em.inquiry_id) { replyingTo = { inquiryId: em.inquiry_id, emailId: em.id }; renderAll(); }
+      else alert('这封邮件没有关联的询盘，无法回复');
+      return;
+    }
+    if (t.dataset.sendReply) { var box = t.closest('[data-reply-box]'); if (box) sendReply(box); return; }
+    if (t.hasAttribute('data-cancel-reply')) { replyingTo = null; renderAll(); return; }
     if (t.dataset.cancelEdit) { editingId = null; renderAll(); return; }
     if (t.dataset.confirmInquiryReview) {
       var card = t.closest('.review-card');

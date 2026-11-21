@@ -126,6 +126,10 @@ button.small{padding:5px 9px;font-size:13px}
 .review-card .r-meta{color:var(--muted);font-size:13px;margin:4px 0}
 .review-card .r-body{background:#f9fafb;border-radius:8px;padding:10px;font-size:13px;white-space:pre-wrap;margin:8px 0}
 .review-card .r-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.reply-box{border-top:1px dashed var(--border);margin-top:10px;padding-top:10px}
+.reply-box .r-orig{background:#f9fafb;border-radius:8px;padding:10px;font-size:13px;white-space:pre-wrap;max-height:220px;overflow:auto;margin-bottom:8px}
+.reply-box input,.reply-box textarea{width:100%;margin-bottom:6px}
+.reply-box textarea{resize:vertical}
 /* 今日待办 */
 .todo-list{margin:0;padding-left:20px}
 .todo-list li{margin-bottom:8px}

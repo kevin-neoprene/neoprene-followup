@@ -1,1 +1,1 @@
-{"dependencies":{"imap":"^0.8.19","mailparser":"^3.7.0"},"description":"Neoprene customer follow-up workbench (Vercel + Supabase) with yunyou.top IMAP email sync","name":"neoprene-followup","private":true,"version":"0.1.0"}
+{"dependencies":{"imap":"^0.8.19","mailparser":"^3.7.0","nodemailer":"^6.9.14"},"description":"Neoprene customer follow-up workbench (Vercel + Supabase) with yunyou.top IMAP email sync and in-system SMTP reply","name":"neoprene-followup","private":true,"version":"0.1.0"}
