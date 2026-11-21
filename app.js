@@ -201,7 +201,9 @@ function verificationLabel(v) { return VERIFICATION_LABELS[v] || VERIFICATION_LA
 // ---------- 搜客池 Phase 1：硬规则 / 打分 / 去重（纯函数，不碰 DOM；Node 下可单测） ----------
 // 规则来源：goodjob-adaptation-plan.pdf 第 5-6 页。顺序：硬规则在前（一条不过直接淘汰，
 //   不进打分、不重复收费），100 分打分在后（只按导入的结构化字段算，缺字段那一维记 0，
-//   绝不编造）。三铁方向按 PDF 第 5 页“新搜客不碰 triathlon”做硬淘汰。
+//   绝不编造）。三铁方向原按 PDF 第 5 页“新搜客不碰 triathlon”做硬淘汰；
+//   2026-11-21 23:20 用户放宽：只拦主营三铁的公司（公司名/产品类别/行业里带三铁），
+//   潜水服厂在官网罗列三铁只是其中一项运动时不拦（见 checkProspectHardRules）。
 // 产品线类别（PDF 第 5 页）：片材线 + 成品线 7 类；命中其中之一 = 产品匹配满分。
 var PROSPECT_EXACT_CATEGORIES = ['潜水服', 'wetsuit', '袖套', '护具', '包袋', '鞋帽', '手套',
   '宠物', '汽车用品', '运动配件', '片材', 'sheet', '潜水料', '氯丁橡胶片材', 'neoprene sheet'];
@@ -214,7 +216,9 @@ var PROSPECT_EVIDENCE_WORDS = ['neoprene', 'chloroprene', '氯丁橡胶', '潜�
 //   （如“密封件/化工厂/采矿”）；“汽车”不放——汽车用品是民用白名单里的品类。
 var PROSPECT_INDUSTRIAL_WORDS = ['industrial', '工业用途', '工业用', 'gasket', '密封件', '化工厂',
   'chemical plant', 'mining', '采矿', 'pipeline', 'hvac', '汽车零部件', '隔热材料', 'insulation material'];
-// 三铁方向：PDF 第 5 页“新内容和新搜客不碰 triathlon（三铁）方向”，写进硬淘汰。
+// 三铁方向：只拦主营三铁的公司（2026-11-21 23:20 用户放宽；原 PDF 第 5 页“新搜客
+//   不碰 triathlon”是凡提及就拦，试搜西班牙时把 Kynay、Ocean Tailored 这类做十几种
+//   水上运动潜水服的厂也拦掉了）。判断只看公司名/产品类别/行业，不看证据摘录。
 var PROSPECT_TRIATHLON_WORDS = ['triathlon', '三铁', '铁人三项'];
 // 排除国家：日本、中国（含港澳台）。国家名 + 域名后缀两道检查。
 var PROSPECT_EXCLUDED_COUNTRIES = ['日本', 'japan', '中国', 'china', '香港', 'hong kong', '澳门', 'macau', '台湾', 'taiwan'];
@@ -230,6 +234,23 @@ function containsWord(haystack, words) {
   var h = String(haystack || '').toLowerCase();
   for (var i = 0; i < words.length; i++) if (h.indexOf(words[i]) !== -1) return words[i];
   return null;
+}
+// 站内搜索（Phase 2）：关键词 + 国家调 /api/prospect-search（DeepSeek），结果复用导入预览/确认流程。
+var PROSPECT_SEARCH_MAX_RESULTS = 10;
+var PROSPECT_SEARCH_SUGGESTIONS = ['定制潜水服', '氯丁橡胶潜水服', '潜水装备', '冲浪潜水服'];
+// 站内搜索导入元数据：与 Excel 导入同一结构（国家/关键词组/来源）。
+function prospectSearchImportMeta(keyword, country) {
+  return { country: String(country || '').trim(), keywordGroup: String(keyword || '').trim(), source: '站内搜索' };
+}
+// 规范化站内搜索返回的公司行：服务端行与 normalizeProspectRow 输出同构，只取已给字段（不编造），
+//   最多取 PROSPECT_SEARCH_MAX_RESULTS 家，来源统一标为站内搜索。
+function normalizeProspectSearchCompanies(companies) {
+  if (!Array.isArray(companies)) return [];
+  return companies.slice(0, PROSPECT_SEARCH_MAX_RESULTS).map(function (c) {
+    var row = normalizeProspectRow(c || {});
+    row.source = '站内搜索';
+    return row;
+  });
 }
 // 域名归一化：去协议、去 www、去路径/参数、小写。空返回 ''。
 function normalizeDomain(d) {
@@ -260,7 +281,7 @@ function parseProspectSize(sizeText, sizeMin, sizeMax) {
 }
 
 // 硬规则（一条不过直接淘汰，不进打分；返回 { ok, reason }，reason 为中文淘汰原因）。
-// 检查顺序：证据 → 用途（含三铁）→ 国家 → 规模 → 官网。
+// 检查顺序：证据 → 用途（含三铁）→ 国家 → 官网。
 function checkProspectHardRules(row) {
   var evidenceText = (row.evidence_excerpt || '') + ' ' + (row.evidence_url || '');
   var useText = (row.product_category || '') + ' ' + (row.industry || '') + ' ' + (row.evidence_excerpt || '');
@@ -270,22 +291,20 @@ function checkProspectHardRules(row) {
   var hasEvidence = !!containsWord(evidenceText, PROSPECT_EVIDENCE_WORDS) ||
     (row.evidence_level === 'image' && String(row.evidence_excerpt || '').trim() !== '');
   if (!hasEvidence) return { ok: false, reason: '无明确潜水料证据' };
-  // 2) 用途：只留民用、商用；工业用途淘汰（哪怕证据明确）；三铁方向不做。
+  // 2) 用途：只留民用、商用；工业用途淘汰（哪怕证据明确）；三铁只拦主营。
+  //   主营判断只看公司名/产品类别/行业：证据摘录里顺带提到三铁（例如潜水服厂
+  //   官网罗列的运动项目里有三铁）不拦——2026-11-21 西班牙试搜 Kynay 就是这么放进来的。
   var ind = containsWord(useText, PROSPECT_INDUSTRIAL_WORDS);
   if (ind) return { ok: false, reason: '工业用途：' + ind };
-  var tri = containsWord(useText, PROSPECT_TRIATHLON_WORDS);
-  if (tri) return { ok: false, reason: '三铁方向不做：' + tri };
+  var mainText = (row.company || '') + ' ' + (row.product_category || '') + ' ' + (row.industry || '');
+  var tri = containsWord(mainText, PROSPECT_TRIATHLON_WORDS);
+  if (tri) return { ok: false, reason: '主营三铁：' + tri };
   // 3) 国家：排除日本、中国（含港澳台域名）。
   if (containsWord(country, PROSPECT_EXCLUDED_COUNTRIES)) return { ok: false, reason: '国家排除：' + country };
   var suffixHit = null;
   PROSPECT_EXCLUDED_DOMAIN_SUFFIXES.forEach(function (s) { if (domain && domain.endsWith(s)) suffixHit = s; });
   if (suffixHit) return { ok: false, reason: '国家排除：域名后缀 ' + suffixHit };
-  // 4) 规模：2-500 人；规模未提供不淘汰（打分那一维记 0），明确 <2 或 >500 才淘汰。
-  var size = parseProspectSize(row.size_text, row.size_min, row.size_max);
-  if (size && (size.max < 2 || size.min > 500)) {
-    return { ok: false, reason: '规模不在 2-500 人：' + (row.size_text || (size.min + '-' + size.max)) };
-  }
-  // 5) 官网：一人作坊 / 无官网只有社媒的淘汰（域名和网址都空 = 无官网）。
+  // 4) 官网：一人作坊 / 无官网只有社媒的淘汰（域名和网址都空 = 无官网）。
   if (!domain) return { ok: false, reason: '无官网（只有社媒或无网址）' };
   return { ok: true, reason: '' };
 }
@@ -2036,6 +2055,30 @@ function renderProspectImportPreview() {
     '<button class="small ghost" data-cancel-prospect-import>取消</button></div></div>';
   setProspectStatus('预览已生成：总 ' + p.rows.length + ' 行，预计入池 ' + r.pooled.length + ' 条，淘汰 ' + r.rejected.length + ' 条，去重跳过 ' + r.skipped.length + ' 条。核对无误再点“确认导入”。');
 }
+// 站内搜索（Phase 2）：关键词 + 国家调 /api/prospect-search，结果喂给导入预览/确认流程。
+async function handleProspectSearch() {
+  var keywordEl = document.getElementById('prospectSearchKeyword');
+  var countryEl = document.getElementById('prospectSearchCountry');
+  var keyword = keywordEl ? keywordEl.value.trim() : '';
+  var country = countryEl ? countryEl.value.trim() : '';
+  if (!keyword) { setProspectStatus('请先输入搜索关键词。', true); return; }
+  if (!country) { setProspectStatus('请先输入国家。', true); return; }
+  setProspectStatus('站内搜索中…');
+  try {
+    var res = await fetch('/api/prospect-search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keyword: keyword, country: country }) });
+    var data = await res.json();
+    if (!data || !data.ok) { setProspectStatus('站内搜索失败：' + (data && data.error ? data.error : '未知错误'), true); return; }
+    var rows = normalizeProspectSearchCompanies(data.companies || []);
+    var result = processProspectImport(rows, state.customers, state.prospects);
+    var mapping = {};
+    ['company', 'domain', 'website', 'country', 'contact_email', 'contact_name', 'contact_role', 'product_category', 'industry', 'size_text', 'size_min', 'size_max', 'evidence_url', 'evidence_excerpt', 'evidence_level', 'source', 'quality_notes', 'notes'].forEach(function (f) { mapping[f] = f; });
+    pendingProspectImport = { rows: rows, mapping: mapping, meta: prospectSearchImportMeta(keyword, country), result: result, fileName: '站内搜索：' + keyword + ' / ' + country };
+    renderProspectImportPreview();
+    setProspectStatus('站内搜索完成：' + (data.note || ('找到 ' + rows.length + ' 家公司，请在预览里确认导入。')));
+  } catch (err) {
+    setProspectStatus('站内搜索失败：' + (err && err.message ? err.message : '网络错误'), true);
+  }
+}
 // 确认导入：先写批次，再批量写候选（自带 UUID，联系人直接关联），最后更新覆盖记忆。
 function confirmProspectImport() {
   var p = pendingProspectImport;
@@ -2764,6 +2807,10 @@ function init() {
   $('filterProspectStatus').addEventListener('change', function () { prospectStatusFilter = $('filterProspectStatus').value; renderProspects(); });
   $('filterProspectBatch').addEventListener('change', function () { prospectBatchFilter = $('filterProspectBatch').value; renderProspects(); });
   $('importProspectBtn').addEventListener('click', function () { $('importProspectFile').click(); });
+  var prospectSearchBtn = $('prospectSearchBtn');
+  if (prospectSearchBtn) prospectSearchBtn.addEventListener('click', handleProspectSearch);
+  var prospectSearchKeyword = $('prospectSearchKeyword');
+  if (prospectSearchKeyword) prospectSearchKeyword.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); handleProspectSearch(); } });
   $('importProspectFile').addEventListener('change', function () { handleProspectFile($('importProspectFile').files[0]); });
   $('refreshProspectsBtn').addEventListener('click', loadAll);
   // 表格复选框（事件委托；每点一次重渲染，勾选状态存在 selectedCustomerIds 里，不会丢）
@@ -2894,6 +2941,12 @@ if (typeof module !== 'undefined' && module.exports) {
     normalizeProspectRow: normalizeProspectRow,
     processProspectImport: processProspectImport,
     buildProspectCandidate: buildProspectCandidate,
-    findProspectCoverageHit: findProspectCoverageHit
+    findProspectCoverageHit: findProspectCoverageHit,
+  // 搜客池 Phase 2（单测用）
+  PROSPECT_SEARCH_MAX_RESULTS: PROSPECT_SEARCH_MAX_RESULTS,
+  PROSPECT_SEARCH_SUGGESTIONS: PROSPECT_SEARCH_SUGGESTIONS,
+  prospectSearchImportMeta: prospectSearchImportMeta,
+  normalizeProspectSearchCompanies: normalizeProspectSearchCompanies,
+  handleProspectSearch: handleProspectSearch
   };
 }
