@@ -244,10 +244,14 @@ function prospectSearchImportMeta(keyword, country) {
 }
 // 规范化站内搜索返回的公司行：服务端行与 normalizeProspectRow 输出同构，只取已给字段（不编造），
 //   最多取 PROSPECT_SEARCH_MAX_RESULTS 家，来源统一标为站内搜索。
+//   normalizeProspectRow 只认 mapping 里的字段，服务端行已是规范字段名，按行自身字段建 identity mapping 再转。
 function normalizeProspectSearchCompanies(companies) {
   if (!Array.isArray(companies)) return [];
   return companies.slice(0, PROSPECT_SEARCH_MAX_RESULTS).map(function (c) {
-    var row = normalizeProspectRow(c || {});
+    var src = c || {};
+    var mapping = {};
+    Object.keys(src).forEach(function (k) { mapping[k] = k; });
+    var row = normalizeProspectRow(src, mapping);
     row.source = '站内搜索';
     return row;
   });
