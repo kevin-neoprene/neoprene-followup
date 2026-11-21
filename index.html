@@ -266,11 +266,22 @@
         <div class="cust-head">
           <div>
             <h2>搜客池 <span class="count-pill" id="prospectCountPill"></span></h2>
-            <p class="subtitle">导入名单后自动按 100 分表打分、去重，≥60 分进复核，≥80 分优先看，低于 40 分自动淘汰。只收文件，不搜客、不验邮箱。</p>
+            <p class="subtitle">导入名单后自动按 100 分表打分、去重，≥60 分进复核，≥80 分优先看，低于 40 分自动淘汰。支持 Excel 导入，也可以在系统内按关键词 + 国家直接搜索。</p>
           </div>
           <div class="cust-head-actions">
             <button class="ghost" id="refreshProspectsBtn" title="刷新搜客池">↻</button>
           </div>
+        </div>
+        <div class="add-row form-grid" id="prospectSearchForm">
+          <input type="text" id="prospectSearchKeyword" list="prospectSearchSuggestions" placeholder="搜索关键词（如 定制潜水服）">
+          <datalist id="prospectSearchSuggestions">
+            <option value="定制潜水服"></option>
+            <option value="氯丁橡胶潜水服"></option>
+            <option value="潜水装备"></option>
+            <option value="冲浪潜水服"></option>
+          </datalist>
+          <input type="text" id="prospectSearchCountry" placeholder="国家（如 西班牙）">
+          <button id="prospectSearchBtn">⌕ 站内搜索</button>
         </div>
         <div class="add-row form-grid" id="prospectImportForm">
           <input type="text" id="prospectBatchCountry" placeholder="本批国家（如 西班牙，可空）">
